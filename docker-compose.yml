@@ -1,0 +1,15 @@
+services:
+  app:
+    container_name: my_app
+    build: .
+    # Maps the port defined in your .env to the host
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    # Loads the exact same config file your native app uses
+    env_file:
+      - .env
+    # Optional: Volume mapping for data persistence (if you have a /data folder)
+    volumes:
+      - ./data:/app/data
+      - ./images:/app/images
+    restart: unless-stopped
