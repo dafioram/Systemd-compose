@@ -1,28 +1,25 @@
 #!/bin/bash
+source ./lib.sh
 
 echo "--- Validating project ---"
-
 fail=false
 
-[ -f app.settings ] || { echo "Missing app.settings"; fail=true; }
-[ -f app.service.template ] || { echo "Missing service template"; fail=true; }
+[ -f app.service.template ] || { echo "Missing app.service.template"; fail=true; }
 
 if grep -q '{{PORT}}' app.settings; then
-    echo "ERROR: EXEC_CMD still contains {{PORT}}"
+    echo "ERROR: EXEC_CMD contains {{PORT}}"
     fail=true
 fi
 
 if [ -f .env ]; then
-    if grep -q '^PORT=' .env && ! grep '^PORT=[0-9]\+$' .env; then
-        echo "ERROR: PORT is not numeric"
+    if grep -q '^PORT=' .env && ! grep -q '^PORT=[0-9]\+$' .env; then
+        echo "ERROR: PORT must be numeric"
         fail=true
     fi
 fi
 
-if systemctl --user >/dev/null 2>&1; then
-    echo "systemd user mode available"
-else
-    echo "WARNING: systemd user mode unavailable"
+if [ "$SYSTEMD_MODE" = "user" ]; then
+    systemctl --user >/dev/null 2>&1 || echo "WARNING: systemd user mode unavailable"
 fi
 
 $fail && exit 1 || echo "Validation OK"

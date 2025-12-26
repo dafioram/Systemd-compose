@@ -1,18 +1,5 @@
 #!/bin/bash
-
-if [ ! -f ./app.settings ]; then
-    echo "Error: app.settings not found"
-    exit 1
-fi
-source ./app.settings
-
-SERVICE_NAME="${APP_NAME}.service"
-
-if [ "$SYSTEMD_MODE" = "user" ]; then
-    SYSTEMCTL="systemctl --user"
-else
-    SYSTEMCTL="systemctl"
-fi
+source ./lib.sh
 
 echo "--- $APP_NAME Status ---"
 
