@@ -1,54 +1,31 @@
 #!/bin/bash
-set -euo pipefail
-
-############################################
-# Load Settings
-############################################
+set -e
 
 if [ ! -f ./app.settings ]; then
     echo "Error: app.settings not found"
     exit 1
 fi
-
 source ./app.settings
 
-SERVICE_FILE="${APP_NAME}.service"
-SERVICE_DIR="$HOME/.config/systemd/user"
-SYSTEMCTL="systemctl --user"
+SERVICE_NAME="${APP_NAME}.service"
 
-echo "--- Stopping and Removing $APP_NAME ---"
-
-############################################
-# Stop and Disable Service
-############################################
-
-if $SYSTEMCTL is-active --quiet "$SERVICE_FILE"; then
-    $SYSTEMCTL stop "$SERVICE_FILE"
-    echo "Service stopped."
-fi
-
-if $SYSTEMCTL is-enabled --quiet "$SERVICE_FILE"; then
-    $SYSTEMCTL disable "$SERVICE_FILE"
-    echo "Service disabled."
-fi
-
-############################################
-# Remove Service File
-############################################
-
-if [ -f "$SERVICE_DIR/$SERVICE_FILE" ]; then
-    rm "$SERVICE_DIR/$SERVICE_FILE"
-    $SYSTEMCTL daemon-reload
-    echo "User systemd service removed."
+if [ "$SYSTEMD_MODE" = "user" ]; then
+    SYSTEMCTL="systemctl --user"
+    SERVICE_DIR="$HOME/.config/systemd/user"
 else
-    echo "Service file not found (already removed?)"
+    SYSTEMCTL="sudo systemctl"
+    SERVICE_DIR="/etc/systemd/system"
 fi
 
-############################################
-# Optional Cleanup
-############################################
+echo "--- Shutting down $APP_NAME ---"
 
-echo "Cleaning up environment..."
-rm -rf venv
+$SYSTEMCTL stop "$SERVICE_NAME" 2>/dev/null || true
+$SYSTEMCTL disable "$SERVICE_NAME" 2>/dev/null || true
 
-echo "Success: $APP_NAME is DOWN and UNINSTALLED."
+rm -f "$SERVICE_DIR/$SERVICE_NAME"
+$SYSTEMCTL daemon-reload
+
+echo "Removing local artifacts..."
+rm -rf .venv app.log error.log
+
+echo "Success: $APP_NAME removed"

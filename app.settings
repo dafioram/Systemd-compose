@@ -2,15 +2,14 @@
 APP_NAME="my-awesome-app"
 APP_DESCRIPTION="An awesome Service"
 
-# --- Network ---
-# The variable name in your .env file that holds the port number
-ENV_PORT_KEY="APP_PORT"
+# --- Runtime ---
+APP_RUNTIME="python"
+VENV_DIR=".venv"
 
 # --- Execution Command ---
-# Use {{VENV}} for the virtualenv bin path
-# Use {{PORT}} for the port number (dynamically grabbed from .env)
-# Examples:
-#   "{{VENV}}/python app.py"
-#   "{{VENV}}/uvicorn main:app --host 0.0.0.0 --port {{PORT}}"
-#   "{{VENV}}/gunicorn -w 4 -b 0.0.0.0:{{PORT}} app:app"
-EXEC_CMD="{{VENV}}/uvicorn main:app --host 0.0.0.0 --port {{PORT}}"
+# {{VENV}} expands to venv/bin
+EXEC_CMD="{{VENV}}/uvicorn main:app"
+
+# --- systemd ---
+SYSTEMD_MODE="user"      # user | system
+ENABLE_LINGER="auto"

@@ -1,9 +1,9 @@
 [Unit]
 Description={{APP_DESCRIPTION}}
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-User={{USER}}
 WorkingDirectory={{WORKING_DIR}}
 ExecStart={{EXEC_START_FINAL}}
 EnvironmentFile={{WORKING_DIR}}/.env
@@ -12,4 +12,4 @@ StandardOutput=append:{{WORKING_DIR}}/app.log
 StandardError=append:{{WORKING_DIR}}/error.log
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

@@ -1,49 +1,28 @@
 #!/bin/bash
-set -euo pipefail
 
-FAIL=0
+echo "--- Validating project ---"
 
-check() {
-    if ! eval "$1"; then
-        echo "[FAIL] $2"
-        FAIL=1
-    else
-        echo "[ OK ] $2"
-    fi
-}
+fail=false
 
-echo "Running validator..."
+[ -f app.settings ] || { echo "Missing app.settings"; fail=true; }
+[ -f app.service.template ] || { echo "Missing service template"; fail=true; }
 
-check "command -v python3 >/dev/null" "python3 installed"
-check "command -v systemctl >/dev/null" "systemctl available"
-check "[ -f app.settings ]" "app.settings exists"
-check "[ -f .env ]" ".env exists"
-
-if loginctl show-user "$USER" -p Linger | grep -q yes; then
-    echo "[ OK ] systemd user lingering enabled"
-else
-    echo "[FAIL] systemd user lingering disabled"
-    echo "       Fix: sudo ./enable-linger.sh"
-    FAIL=1
+if grep -q '{{PORT}}' app.settings; then
+    echo "ERROR: EXEC_CMD still contains {{PORT}}"
+    fail=true
 fi
 
-if [ -f .env ] && [ -f app.settings ]; then
-    source app.settings
-    PORT=$(grep -E "^${ENV_PORT_KEY}=[0-9]+" .env | cut -d= -f2 || true)
-
-    if [ -n "$PORT" ] && [ "$PORT" -ge 1024 ]; then
-        echo "[ OK ] application port ($PORT) valid for rootless"
-    else
-        echo "[FAIL] application port invalid or privileged"
-        FAIL=1
+if [ -f .env ]; then
+    if grep -q '^PORT=' .env && ! grep '^PORT=[0-9]\+$' .env; then
+        echo "ERROR: PORT is not numeric"
+        fail=true
     fi
 fi
 
-if [ "$FAIL" -eq 1 ]; then
-    echo
-    echo "Validator FAILED"
-    exit 1
+if systemctl --user >/dev/null 2>&1; then
+    echo "systemd user mode available"
 else
-    echo
-    echo "Validator PASSED"
+    echo "WARNING: systemd user mode unavailable"
 fi
+
+$fail && exit 1 || echo "Validation OK"
