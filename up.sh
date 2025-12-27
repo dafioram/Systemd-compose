@@ -1,25 +1,23 @@
 #!/bin/bash
 set -e
+
 source ./lib.sh
 
 echo "--- Bringing up $APP_NAME ---"
 
-require_cmd python3
+require_python_deps
+check_linger
 ensure_service_dir
 
 # -----------------------------
 # Virtualenv
 # -----------------------------
 
-if [ ! -d "$VENV_DIR" ]; then
-    echo "Creating virtualenv..."
-    python3 -m venv "$VENV_DIR"
-    "$VENV_DIR/bin/pip" install --upgrade pip
-fi
+ensure_venv
 
 if [ -f requirements.txt ]; then
     echo "Installing dependencies..."
-    "$VENV_DIR/bin/pip" install -r requirements.txt
+    "$VENV_DIR/bin/python" -m pip install -r requirements.txt
 fi
 
 # -----------------------------

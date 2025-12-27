@@ -1,16 +1,30 @@
 #!/bin/bash
 set -e
+
 source ./lib.sh
 
-echo "--- Shutting down $APP_NAME ---"
+echo "--- Bringing down $APP_NAME ---"
 
-$SYSTEMCTL stop "$SERVICE_NAME" 2>/dev/null || true
-$SYSTEMCTL disable "$SERVICE_NAME" 2>/dev/null || true
+if $SYSTEMCTL is-active --quiet "$SERVICE_NAME"; then
+    $SYSTEMCTL stop "$SERVICE_NAME"
+    echo "Service stopped"
+else
+    echo "Service not running"
+fi
 
-rm -f "$SERVICE_DIR/$SERVICE_NAME"
-$SYSTEMCTL daemon-reload
+if $SYSTEMCTL is-enabled --quiet "$SERVICE_NAME"; then
+    $SYSTEMCTL disable "$SERVICE_NAME"
+    echo "Service disabled"
+fi
 
-echo "Cleaning up local artifacts..."
-rm -rf "$VENV_DIR" app.log error.log
+SERVICE_FILE="$SERVICE_DIR/$SERVICE_NAME"
 
-echo "Success: $APP_NAME removed"
+if [ -f "$SERVICE_FILE" ]; then
+    rm "$SERVICE_FILE"
+    $SYSTEMCTL daemon-reload
+    echo "Service file removed"
+else
+    echo "Service file not found"
+fi
+
+echo "Success: $APP_NAME is down"
