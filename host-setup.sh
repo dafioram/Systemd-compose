@@ -18,7 +18,6 @@ INSTALLED_NEW_DEPS=0
 # 1. Check for Debian Packages
 for dep in "${DEPS[@]}"; do
     if ! dpkg -s "$dep" >/dev/null 2>&1; then
-        # Check if command exists (fallback for packages with different binary names)
         if ! command -v "$dep" &> /dev/null; then
              MISSING_DEPS+=("$dep")
         fi
@@ -26,7 +25,7 @@ for dep in "${DEPS[@]}"; do
 done
 
 # 2. Check Systemd Linger
-LINGER_STATE=$(loginctl show-user "$USER" --property=Linger | cut -d= -f2)
+LINGER_STATE=$(loginctl show-user "$USER" --property=Linger 2>/dev/null | cut -d= -f2)
 
 # --- ACTION: INSTALL DEPS ---
 
@@ -36,8 +35,13 @@ if [ ${#MISSING_DEPS[@]} -ne 0 ]; then
     read -p "❓ Install them now? (Requires sudo) [y/N] " -n 1 -r
     echo ""
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo "pw" | sudo -S apt update
-        sudo apt install -y "${MISSING_DEPS[@]}"
+        # Check if sudo requires password or if we are already root
+        if [ "$EUID" -ne 0 ]; then
+            echo "pw" | sudo -S apt update
+            sudo apt install -y "${MISSING_DEPS[@]}"
+        else
+            apt update && apt install -y "${MISSING_DEPS[@]}"
+        fi
         INSTALLED_NEW_DEPS=1
     else
         echo "⚠️  Skipping installation. Framework will likely fail."
@@ -54,8 +58,14 @@ if [ "$LINGER_STATE" != "yes" ]; then
     read -p "❓ Enable Linger now? [y/N] " -n 1 -r
     echo ""
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        loginctl enable-linger "$USER"
-        echo "✅ Linger enabled."
+        # [FIX] Use sudo to bypass missing pkttyagent on minimal systems
+        if sudo loginctl enable-linger "$USER"; then
+            echo "✅ Linger enabled."
+        else
+            echo "❌ Failed to enable linger."
+            echo "   This is common on DietPi/Minimal installs before a reboot."
+            echo "   Please REBOOT and try again."
+        fi
     fi
 else
     echo "✅ Systemd Linger is enabled."
