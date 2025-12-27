@@ -1,311 +1,170 @@
-Below are **production-ready, Debian-correct, rootless-first** rewrites of:
-
-* `status.sh`
-* `restart.sh`
-* `README.md`
-
-These are fully consistent with your current `lib.sh`, `.env`, `app.settings`, and systemd user-service model.
-
----
-
-## `status.sh` (full rewrite)
-
-Improvements over your current version:
-
-* Uses `ENV_PORT_KEY` (not hardcoded `PORT`)
-* Handles user/system mode transparently
-* More robust PID + port detection
-* Cleaner output
-* No false warnings when port cannot be detected
-
-```bash
-#!/bin/bash
-set -e
-
-source ./lib.sh
-
-echo "--- $APP_NAME Status ---"
-
-if ! $SYSTEMCTL is-active --quiet "$SERVICE_NAME"; then
-    echo "Status: DOWN"
-    exit 0
-fi
-
-echo "Status: ACTIVE"
-
-PID="$($SYSTEMCTL show -p MainPID --value "$SERVICE_NAME")"
-echo "PID:    $PID"
-
-if [ -z "$PID" ] || [ "$PID" = "0" ]; then
-    echo "Process not fully started yet"
-    exit 0
-fi
-
-# -----------------------------
-# Memory usage
-# -----------------------------
-
-if ps -p "$PID" >/dev/null 2>&1; then
-    RAM=$(ps -p "$PID" -o rss= | awk '{printf "%.2f MB", $1/1024}')
-    echo "Memory: $RAM"
-fi
-
-# -----------------------------
-# Port detection
-# -----------------------------
-
-PORT=$(ss -lntp 2>/dev/null \
-    | grep "pid=$PID" \
-    | grep -oP '(?<=:)\d+' \
-    | head -n1)
-
-echo "Port:   ${PORT:-Unknown}"
-
-# -----------------------------
-# Configuration audit
-# -----------------------------
-
-if [ -f .env ]; then
-    ENV_PORT=$(grep -E "^${ENV_PORT_KEY}=" .env | cut -d= -f2)
-    if [ -n "$ENV_PORT" ] && [ -n "$PORT" ] && [ "$ENV_PORT" != "$PORT" ]; then
-        echo "Warning: .env ${ENV_PORT_KEY}=$ENV_PORT but process bound to $PORT"
-    fi
-fi
-```
-
----
-
-## `restart.sh` (full rewrite)
-
-Key decisions:
-
-* No sudo
-* Pulls git changes if applicable
-* Delegates lifecycle to `up.sh` (single source of truth)
-* Safe even if not a git repo
-
-```bash
-#!/bin/bash
-set -e
-
-source ./lib.sh
-
-echo "--- Restarting $APP_NAME ---"
-
-if [ -d .git ]; then
-    echo "Pulling latest changes..."
-    git pull || echo "Git pull failed (continuing)"
-else
-    echo "Not a git repository; skipping pull"
-fi
-
-./up.sh
-
-echo "Success: $APP_NAME restarted"
-```
-
----
-
-## `README.md` (documentation)
-
-This documents **exactly** how your framework works and why it exists.
-
 ```markdown
-# App Lifecycle Framework (systemd + Python venv)
+# App-Ctl
 
-This project provides a **Docker-like lifecycle** for Python web applications using:
+A **rootless**, **Docker-like** process manager for Python applications on Debian/Ubuntu systems.
 
-- systemd (user or system mode)
-- Python virtual environments
-- `.env` configuration
-- Zero containers
-- Rootless by default (Debian-correct)
+App-Ctl allows you to manage Python projects (Flask, FastAPI, scripts, bots) using a familiar workflow (`build`, `up`, `down`, `logs`) without the overhead or complexity of Docker containers. It leverages native Linux tools (`systemd --user`, `venv`, `pip`) to ensure your apps are robust, isolated, and auto-start on boot—all without needing `sudo` for day-to-day operations.
 
----
+## ✨ Features
 
-## Philosophy
-
-This framework mirrors Docker concepts:
-
-| Docker Concept | This Framework |
-|----------------|----------------|
-| Container      | systemd service |
-| Image          | Git repo + venv |
-| docker-compose | app.settings + .env |
-| docker up      | up.sh |
-| docker down    | down.sh |
-| docker logs    | logs.sh |
-| docker restart | restart.sh |
-
-It is designed to:
-- Work cleanly on Debian
-- Avoid implicit sudo
-- Keep host and app responsibilities separate
-- Be transparent and debuggable
+* **Rootless Architecture:** Runs entirely in userspace using `systemd --user`.
+* **Docker-like CLI:** Commands like `up`, `down`, `ps`, and `logs` make it easy to learn.
+* **Isolated Environments:** Automatically creates and manages Python `venvs` for each project.
+* **Zero-Downtime Config:** Change secrets in `.env` and restart instantly.
+* **Flexible:** Supports standard Python scripts, Uvicorn (FastAPI), and Gunicorn out of the box.
+* **Global Dashboard:** View the status of all your apps with a single `ps` command.
 
 ---
 
-## Directory Structure
+## 🚀 Installation
 
-Recommended layout:
-
-```
-
-project/
-├── app/
-│   └── main.py
-├── 
-│   ├── lib.sh
-│   ├── up.sh
-│   ├── down.sh
-│   ├── restart.sh
-│   ├── status.sh
-│   ├── logs.sh
-│   ├── validator.sh
-│   ├── install-deps.sh
-│   └── enable_linger.sh
-├── .env
-├── app.settings
-├── requirements.txt
-├── app.service.template
-└── .venv/
-
-````
-
-Run scripts from the **project root**.
-
----
-
-## One-Time Host Setup (Debian)
-
-Run once per machine:
+### 1. Clone & Setup
+Clone this repository to your home directory (recommended location: `~/app-ctl`).
 
 ```bash
-sudo ./install-deps.sh
-````
+git clone <your-repo-url> ~/app-ctl
+cd ~/app-ctl
 
-Optional but recommended for user services:
+```
+
+### 2. Run Host Setup
+
+This script installs necessary system dependencies (like `python3-venv`, `git`, `lsof`), enables systemd lingering (so apps run after logout), and links the binary to your path.
 
 ```bash
-sudo loginctl enable-linger <username>
+./host-setup.sh
+
 ```
 
----
+**Note:** You will need `sudo` access only once during this step to install the Debian packages.
 
-## Configuration
+### 3. Verify
 
-### `app.settings`
-
-Defines identity and execution command:
+You can now run `app-ctl` from anywhere.
 
 ```bash
-APP_NAME="my-awesome-app"
-APP_DESCRIPTION="An awesome service"
-ENV_PORT_KEY="APP_PORT"
-EXEC_CMD="{{VENV}}/uvicorn main:app --host 0.0.0.0 --port {{PORT}}"
-```
+app-ctl --help
 
-### `.env`
-
-Defines runtime configuration (Docker-style):
-
-```env
-APP_PORT=8000
 ```
 
 ---
 
-## Lifecycle Commands
+## 🛠 Usage
 
-From project root:
+### Creating a New Project
+
+You can copy the included example to get started.
 
 ```bash
-./up.sh        # Build venv, install deps, start service
-./down.sh      # Stop and remove service
-./restart.sh   # Pull + rebuild + restart
-./status.sh    # Show health and diagnostics
-./logs.sh      # Tail logs
+cp -r ~/app-ctl/projects/example-app ~/my-new-bot
+cd ~/my-new-bot
+
 ```
 
----
+### The Workflow
 
-## systemd Modes
+| Command | Description |
+| --- | --- |
+| `app-ctl . build` | Creates the `venv` and installs `requirements.txt`. |
+| `app-ctl . run` | Generates the Systemd service and starts the app. |
+| `app-ctl . up` | **Recommended.** Runs `build` + `run` (like `docker-compose up`). |
+| `app-ctl . stop` | Stops the process (preserves venv and logs). |
+| `app-ctl . down` | Stops the process, removes the service, and **deletes the venv**. |
+| `app-ctl . logs` | Tails the real-time logs of the application. |
+| `app-ctl . status` | Shows detailed status (PID, Memory, Port connectivity). |
 
-Default is **user mode** (rootless):
+### Global Dashboard
+
+To see all running projects managed by App-Ctl:
 
 ```bash
-SYSTEMD_MODE=user
+app-ctl ps
+
 ```
 
-System mode is supported but requires root:
+---
+
+## 📂 Project Structure
+
+To "drop in" an existing Python project, just add these two files to your project root:
+
+### 1. `config.env` (Project Definition)
+
+This file defines *what* to run. It should be committed to Git.
 
 ```bash
-SYSTEMD_MODE=system
-sudo ./control/up.sh
-```
+APP_NAME="my-awesome-bot"
+DESCRIPTION="A Discord bot"
 
----
+# DIRECTORY STRUCTURE
+# Use "." if your main script is in the root.
+# Use "src" or "app" if your code is in a subfolder.
+APP_DIR="."
 
-## Debian Python Model (Important)
-
-* `pip` is bootstrapped **inside each venv**
-* Host pip is optional
-* This is intentional and Debian-correct
-* Each app is isolated
-
----
-
-## Logs
-
-Logs are written to:
+# RUNNER CONFIGURATION
+ENTRYPOINT="python"
+ARGS="${INSTALL_DIR}/${APP_DIR}/bot.py"
 
 ```
-app.log
-error.log
-```
 
-Managed by systemd.
+### 2. `.env` (Secrets & Local Config)
 
----
+This file defines *how* to run (Ports, Keys). **Add this to `.gitignore**`.
 
-## Why Not Docker?
-
-* No container overhead
-* Native system integration
-* Faster startup
-* Easier debugging
-* Fewer moving parts
-
-This is ideal for:
-
-* Homelabs
-* Single-host deployments
-* Internal services
-* Lightweight production systems
-
----
-
-## License / Usage
-
-Internal tooling. Adapt freely.
+```bash
+PORT=8000
+SECRET_KEY=super_secret_value
 
 ```
 
 ---
 
-## Final Notes
+## ⚙️ Configuration
 
-At this point, your framework is:
+### Switching to FastAPI / Uvicorn
 
-- Architecturally sound
-- Debian-policy compliant
-- Rootless by default
-- Docker-conceptually consistent
-- Safe to replicate across projects
+Edit your `config.env`:
 
-If you want next:
-- `logs.sh` upgrade (journalctl support)
-- `restart.sh --no-pull`
-- `status.sh --json`
-- Versioned templates
-- Multi-service support
+```bash
+ENTRYPOINT="uvicorn"
+# Syntax: <file_module>:<app_object>
+ARGS="main:app --app-dir ${INSTALL_DIR}/${APP_DIR} --host 0.0.0.0 --port $PORT"
+
+```
+
+*Remember to add `uvicorn` to your `requirements.txt`!*
+
+### Customizing the Project Root
+
+By default, `app-ctl ps` looks for projects in `~/app-ctl/projects/`.
+If you keep your code elsewhere (e.g., `~/Development`), configure the global environment:
+
+1. Copy the example config:
+```bash
+cp ~/app-ctl/.env.example ~/app-ctl/.env
+
+```
+
+
+2. Edit `~/app-ctl/.env`:
+```bash
+APPS_ROOT="$HOME/Development"
+
+```
+
+
+
+---
+
+## 🗑 Uninstall
+
+To remove the symlink and cleanup:
+
+```bash
+# Remove the symlink
+sudo rm /usr/local/bin/app-ctl
+
+# (Optional) Disable background processing for your user
+loginctl disable-linger $USER
+
+```
