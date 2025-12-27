@@ -11,14 +11,10 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
 fi
 APPS_ROOT="${APPS_ROOT:-$SCRIPT_DIR/projects}"
 
-# --- ARGUMENT PARSING [UPDATED] ---
+# --- ARGUMENT PARSING ---
 
-# Check if the first argument is 'ps' (Global Command)
 if [ "$1" == "ps" ]; then
     COMMAND="ps"
-    # No project directory needed
-
-# Check for standard usage: <folder> <command>
 elif [ -n "$1" ] && [ -n "$2" ]; then
     PROJECT_DIR_ARG="$1"
     COMMAND="$2"
@@ -30,7 +26,6 @@ else
 fi
 
 # --- PROJECT CONTEXT LOADING ---
-# Only load project details if we are NOT running 'ps'
 
 if [ "$COMMAND" != "ps" ]; then
     if [ ! -d "$PROJECT_DIR_ARG" ]; then
@@ -40,12 +35,14 @@ if [ "$COMMAND" != "ps" ]; then
     PROJECT_DIR="$(realpath "$PROJECT_DIR_ARG")"
     INSTALL_DIR="$PROJECT_DIR"
     
-    # Load Project .env (Secrets)
+    # [FIX 1] Robust .env Loading
+    # Handles comments, DOS line endings (\r), and exports automatically
     if [ -f "$PROJECT_DIR/.env" ]; then
-        export $(grep -v '^#' "$PROJECT_DIR/.env" | xargs)
+        set -a
+        source <(sed 's/\r$//' "$PROJECT_DIR/.env" | grep -v '^\s*#')
+        set +a
     fi
 
-    # Load Config.env (Structure)
     if [ -f "$PROJECT_DIR/config.env" ]; then
         source "$PROJECT_DIR/config.env"
     else
@@ -53,13 +50,8 @@ if [ "$COMMAND" != "ps" ]; then
         exit 1
     fi
     
-    # Sanitize APP_NAME (Spaces -> Hyphens)
     APP_NAME=$(echo "$APP_NAME" | tr ' ' '-')
-
-    # Default APP_DIR to "."
-    if [ -z "$APP_DIR" ]; then
-        APP_DIR="."
-    fi
+    if [ -z "$APP_DIR" ]; then APP_DIR="."; fi
 
     SYSTEMD_DIR="$HOME/.config/systemd/user"
     SERVICE_FILE="$SYSTEMD_DIR/${APP_NAME}.service"
@@ -68,9 +60,16 @@ fi
 # --- HELPER FUNCTIONS ---
 
 check_port() {
-    if [ -z "$PORT" ]; then return 0; fi
+    # [FIX 2] Explicitly warn if check is skipped
+    if [ -z "$PORT" ]; then 
+        echo "⚠️  Warning: PORT variable not found. Skipping port check."
+        return 0
+    fi
+
+    # Check for listening ports (both IPv4 and IPv6)
     if ss -tuln | grep -q ":$PORT "; then
         echo "❌ Error: Port $PORT is already in use."
+        echo "   Process blocking this port:"
         lsof -i :$PORT | grep LISTEN
         return 1
     fi
@@ -132,7 +131,16 @@ run() {
 
     systemctl --user daemon-reload
     systemctl --user enable "${APP_NAME}"
-    systemctl --user restart "${APP_NAME}"
+    
+    # [FIX 3] Capture Systemd Failure
+    if ! systemctl --user restart "${APP_NAME}"; then
+        echo ""
+        echo "❌ Fatal: Systemd failed to start the service."
+        echo "   This usually means the app crashed immediately (e.g., port conflict)."
+        echo "--- 📜 Last 10 Log Lines ---"
+        journalctl --user -u "${APP_NAME}" -n 10 --no-pager
+        exit 1
+    fi
     
     echo "Service started."
     sleep 1
@@ -207,15 +215,9 @@ ps_dashboard() {
     for proj in "$SEARCH_DIR"/*; do
         if [ -d "$proj" ] && [ -f "$proj/config.env" ]; then
             RAW_NAME=$(grep '^APP_NAME=' "$proj/config.env" | cut -d '"' -f 2)
-            NAME=$(echo "$RAW_NAME" | tr ' ' '-') # Sanitize
-            
-            # Check systemd status
-            # 'unknown' = Service file deleted (app-ctl down)
-            # 'inactive' = Service file exists but stopped (app-ctl stop)
-            # 'active' = Running
+            NAME=$(echo "$RAW_NAME" | tr ' ' '-')
             RAW_STATUS=$(systemctl --user is-active "$NAME" 2>/dev/null || echo "unknown")
             
-            # Map raw systemd status to pretty output
             case "$RAW_STATUS" in
                 active)      DISPLAY_STATUS="RUNNING" ;;
                 inactive)    DISPLAY_STATUS="STOPPED" ;;
@@ -230,14 +232,11 @@ ps_dashboard() {
 
             if [ "$DISPLAY_STATUS" == "RUNNING" ]; then
                 PID=$(systemctl --user show --property MainPID --value "$NAME")
-                # Format uptime nicely
                 UPTIME=$(ps -p "$PID" -o etime= 2>/dev/null | xargs)
             fi
-
             if [ -f "$proj/.env" ]; then
                 PORT_VAL=$(grep '^PORT=' "$proj/.env" | cut -d '=' -f 2)
             fi
-            
             printf "%-25s %-12s %-10s %-8s %-20s\n" "$NAME" "$DISPLAY_STATUS" "$PID" "$PORT_VAL" "$UPTIME"
         fi
     done
