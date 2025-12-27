@@ -24,9 +24,6 @@ for dep in "${DEPS[@]}"; do
     fi
 done
 
-# 2. Check Systemd Linger
-LINGER_STATE=$(loginctl show-user "$USER" --property=Linger 2>/dev/null | cut -d= -f2)
-
 # --- ACTION: INSTALL DEPS ---
 
 if [ ${#MISSING_DEPS[@]} -ne 0 ]; then
@@ -50,7 +47,39 @@ else
     echo "✅ All system packages installed."
 fi
 
+# --- HELPER: FIX DIETPI / MINIMAL LOGIND ---
+
+ensure_logind_service() {
+    # Check if systemd-logind is masked (Standard on DietPi)
+    IS_MASKED=$(systemctl is-enabled systemd-logind 2>/dev/null)
+    
+    if [ "$IS_MASKED" == "masked" ]; then
+        echo "⚠️  Detected masked systemd-logind (Common on DietPi)."
+        echo "   Unmasking and starting login manager..."
+        sudo systemctl unmask systemd-logind
+        sudo systemctl daemon-reload
+        sudo systemctl start systemd-logind
+        echo "✅ systemd-logind unmasked and started."
+    fi
+
+    # Check for the specific "File exists" symlink bug
+    if [ -L "/etc/systemd/system/dbus-org.freedesktop.login1.service" ]; then
+        # If the service is running but this link exists, it might block loginctl
+        if ! loginctl show-user "$USER" &>/dev/null; then
+             echo "⚠️  Detected conflicting D-Bus symlink. Removing..."
+             sudo rm /etc/systemd/system/dbus-org.freedesktop.login1.service
+             sudo systemctl daemon-reload
+             echo "✅ Conflict removed."
+        fi
+    fi
+}
+
 # --- ACTION: ENABLE LINGER ---
+
+# Run the fix routine first
+ensure_logind_service
+
+LINGER_STATE=$(loginctl show-user "$USER" --property=Linger 2>/dev/null | cut -d= -f2)
 
 if [ "$LINGER_STATE" != "yes" ]; then
     echo "⚠️  Systemd Linger is DISABLED for user $USER."
@@ -58,7 +87,7 @@ if [ "$LINGER_STATE" != "yes" ]; then
     read -p "❓ Enable Linger now? [y/N] " -n 1 -r
     echo ""
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        # [FIX] Use sudo to bypass missing pkttyagent on minimal systems
+        # Use sudo to force it if user permissions are borked
         if sudo loginctl enable-linger "$USER"; then
             echo "✅ Linger enabled."
         else
