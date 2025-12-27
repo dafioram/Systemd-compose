@@ -208,20 +208,37 @@ ps_dashboard() {
         if [ -d "$proj" ] && [ -f "$proj/config.env" ]; then
             RAW_NAME=$(grep '^APP_NAME=' "$proj/config.env" | cut -d '"' -f 2)
             NAME=$(echo "$RAW_NAME" | tr ' ' '-') # Sanitize
-            STATUS=$(systemctl --user is-active "$NAME" 2>/dev/null || echo "not-found")
+            
+            # Check systemd status
+            # 'unknown' = Service file deleted (app-ctl down)
+            # 'inactive' = Service file exists but stopped (app-ctl stop)
+            # 'active' = Running
+            RAW_STATUS=$(systemctl --user is-active "$NAME" 2>/dev/null || echo "unknown")
+            
+            # Map raw systemd status to pretty output
+            case "$RAW_STATUS" in
+                active)      DISPLAY_STATUS="RUNNING" ;;
+                inactive)    DISPLAY_STATUS="STOPPED" ;;
+                unknown)     DISPLAY_STATUS="UNREGISTERED" ;;
+                failed)      DISPLAY_STATUS="CRASHED" ;;
+                *)           DISPLAY_STATUS="$RAW_STATUS" ;;
+            esac
             
             PID="-"
             UPTIME="-"
             PORT_VAL="-"
 
-            if [ "$STATUS" == "active" ]; then
+            if [ "$DISPLAY_STATUS" == "RUNNING" ]; then
                 PID=$(systemctl --user show --property MainPID --value "$NAME")
+                # Format uptime nicely
                 UPTIME=$(ps -p "$PID" -o etime= 2>/dev/null | xargs)
             fi
+
             if [ -f "$proj/.env" ]; then
                 PORT_VAL=$(grep '^PORT=' "$proj/.env" | cut -d '=' -f 2)
             fi
-            printf "%-25s %-12s %-10s %-8s %-20s\n" "$NAME" "$STATUS" "$PID" "$PORT_VAL" "$UPTIME"
+            
+            printf "%-25s %-12s %-10s %-8s %-20s\n" "$NAME" "$DISPLAY_STATUS" "$PID" "$PORT_VAL" "$UPTIME"
         fi
     done
     echo "-----------------------------------------------------------------------------------------"
