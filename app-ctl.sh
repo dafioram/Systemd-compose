@@ -21,7 +21,7 @@ elif [ -n "$1" ] && [ -n "$2" ]; then
 else
     echo "Usage:"
     echo "  Global:  app-ctl ps"
-    echo "  Project: app-ctl <project_folder> [up|down|build|run|stop|status|logs]"
+    echo "  Project: app-ctl <project_folder> [up|down|build|run|stop|restart|status|logs]"
     exit 1
 fi
 
@@ -157,6 +157,30 @@ stop() {
     fi
 }
 
+restart() {
+    echo "--- ♻️  Restarting ${APP_NAME} ---"
+    
+    # Check if the service is actually installed
+    if ! systemctl --user list-unit-files "${APP_NAME}.service" >/dev/null 2>&1; then
+        echo "❌ Service '${APP_NAME}' is not installed."
+        echo "   Run 'app-ctl <project> up' first to build and install it."
+        exit 1
+    fi
+
+    # Trigger restart
+    systemctl --user restart "${APP_NAME}"
+    
+    # Validate health
+    if systemctl --user is-active --quiet "${APP_NAME}"; then
+        echo "✅ Restarted successfully."
+        # Show status to verify PID/Port
+        status
+    else
+        echo "❌ Restart Failed. Check logs:"
+        journalctl --user -u "${APP_NAME}" -n 10 --no-pager
+    fi
+}
+
 status() {
     echo "--- 📊 Status: ${APP_NAME} ---"
     IS_ACTIVE=$(systemctl --user is-active "${APP_NAME}")
@@ -245,13 +269,14 @@ ps_dashboard() {
 
 # --- DISPATCHER ---
 case "$COMMAND" in
-    up)     up ;;
-    down)   down ;;
-    build)  build ;;
-    run)    run ;;
-    stop)   stop ;;
-    status) status ;;
-    logs)   logs ;;
-    ps)     ps_dashboard ;;
-    *)      echo "Unknown command: $COMMAND" ;;
+    up)      up ;;
+    down)    down ;;
+    build)   build ;;
+    run)     run ;;
+    stop)    stop ;;
+    restart) restart ;;
+    status)  status ;;
+    logs)    logs ;;
+    ps)      ps_dashboard ;;
+    *)       echo "Unknown command: $COMMAND" ;;
 esac
