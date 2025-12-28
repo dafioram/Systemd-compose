@@ -6,7 +6,8 @@
 # git:               Version control
 # lsof:              Used to check for blocking ports
 # dbus-user-session: REQUIRED for 'systemctl --user' on minimal distros (DietPi)
-DEPS=("python3" "python3-venv" "python3-pip" "git" "lsof" "dbus-user-session")
+# libpam-systemd:    Triggers systemd startup on login
+DEPS=("python3" "python3-venv" "python3-pip" "git" "lsof" "dbus-user-session" "libpam-systemd")
 TARGET_LINK="/usr/local/bin/app-ctl"
 SOURCE_SCRIPT="$(dirname "$(realpath "$0")")/app-ctl.sh"
 
@@ -14,6 +15,7 @@ echo "=== 🛠️  Host Dependency Check ==="
 
 MISSING_DEPS=()
 INSTALLED_NEW_DEPS=0
+GROUPS_CHANGED=0
 
 # 1. Check for Debian Packages
 for dep in "${DEPS[@]}"; do
@@ -32,7 +34,6 @@ if [ ${#MISSING_DEPS[@]} -ne 0 ]; then
     read -p "❓ Install them now? (Requires sudo) [y/N] " -n 1 -r
     echo ""
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        # Check if sudo requires password or if we are already root
         if [ "$EUID" -ne 0 ]; then
             echo "pw" | sudo -S apt update
             sudo apt install -y "${MISSING_DEPS[@]}"
@@ -50,7 +51,6 @@ fi
 # --- HELPER: FIX DIETPI / MINIMAL LOGIND ---
 
 ensure_logind_service() {
-    # Check if systemd-logind is masked (Standard on DietPi)
     IS_MASKED=$(systemctl is-enabled systemd-logind 2>/dev/null)
     
     if [ "$IS_MASKED" == "masked" ]; then
@@ -62,9 +62,7 @@ ensure_logind_service() {
         echo "✅ systemd-logind unmasked and started."
     fi
 
-    # Check for the specific "File exists" symlink bug
     if [ -L "/etc/systemd/system/dbus-org.freedesktop.login1.service" ]; then
-        # If the service is running but this link exists, it might block loginctl
         if ! loginctl show-user "$USER" &>/dev/null; then
              echo "⚠️  Detected conflicting D-Bus symlink. Removing..."
              sudo rm /etc/systemd/system/dbus-org.freedesktop.login1.service
@@ -74,10 +72,51 @@ ensure_logind_service() {
     fi
 }
 
-# --- ACTION: ENABLE LINGER ---
+# --- HELPER: FIX SHELL ENVIRONMENT ---
 
-# Run the fix routine first
+fix_shell_environment() {
+    if pgrep -u "$USER" -f "systemd --user" >/dev/null; then
+        if [ -z "$XDG_RUNTIME_DIR" ] || [ ! -d "$XDG_RUNTIME_DIR" ]; then
+            EXPECTED_DIR="/run/user/$(id -u)"
+            if [ -d "$EXPECTED_DIR" ]; then
+                echo "⚠️  Systemd is running, but shell environment variables are missing."
+                echo "   Patching ~/.bashrc to fix this..."
+                if ! grep -q "XDG_RUNTIME_DIR" "$HOME/.bashrc"; then
+                    echo "" >> "$HOME/.bashrc"
+                    echo "# App-Ctl Fix: Define XDG vars for systemd user session" >> "$HOME/.bashrc"
+                    echo "export XDG_RUNTIME_DIR=\"$EXPECTED_DIR\"" >> "$HOME/.bashrc"
+                    echo "export DBUS_SESSION_BUS_ADDRESS=\"unix:path=\${XDG_RUNTIME_DIR}/bus\"" >> "$HOME/.bashrc"
+                    echo "✅ Fix added to ~/.bashrc"
+                fi
+                export XDG_RUNTIME_DIR="$EXPECTED_DIR"
+                export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+            fi
+        fi
+    fi
+}
+
+# --- ACTION: APPLY FIXES ---
+
 ensure_logind_service
+fix_shell_environment
+
+# --- ACTION: LOG PERMISSIONS ---
+
+if groups "$USER" | grep -q "systemd-journal"; then
+    echo "✅ User is in 'systemd-journal' group (Logs visible)."
+else
+    echo "⚠️  User '$USER' is NOT in 'systemd-journal' group."
+    echo "   You won't be able to see app logs without this."
+    read -p "❓ Add user to group now? (Requires sudo) [y/N] " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        sudo usermod -aG systemd-journal "$USER"
+        echo "✅ User added to group."
+        GROUPS_CHANGED=1
+    fi
+fi
+
+# --- ACTION: ENABLE LINGER ---
 
 LINGER_STATE=$(loginctl show-user "$USER" --property=Linger 2>/dev/null | cut -d= -f2)
 
@@ -87,13 +126,11 @@ if [ "$LINGER_STATE" != "yes" ]; then
     read -p "❓ Enable Linger now? [y/N] " -n 1 -r
     echo ""
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        # Use sudo to force it if user permissions are borked
         if sudo loginctl enable-linger "$USER"; then
             echo "✅ Linger enabled."
         else
             echo "❌ Failed to enable linger."
-            echo "   This is common on DietPi/Minimal installs before a reboot."
-            echo "   Please REBOOT and try again."
+            echo "   Please REBOOT your server and run this script again."
         fi
     fi
 else
@@ -122,12 +159,8 @@ else
 fi
 
 echo "=== Setup Complete ==="
-
-# --- FINAL CHECK FOR DIETPI/MINIMAL USERS ---
-if [ "$INSTALLED_NEW_DEPS" -eq 1 ]; then
+if [ "$GROUPS_CHANGED" -eq 1 ]; then
     echo ""
-    echo "⚠️  NOTE: New system packages were installed."
-    echo "   If you are on DietPi or a minimal server, 'systemctl --user' might not work yet."
-    echo "   Please REBOOT your server to initialize the User Bus."
-    echo "   Command: sudo reboot"
+    echo "⚠️  IMPORTANT: You must LOG OUT and LOG BACK IN for group changes to take effect."
+    echo "   (Or reboot if you installed system packages)"
 fi
