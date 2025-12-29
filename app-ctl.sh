@@ -9,7 +9,11 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
     source "$SCRIPT_DIR/.env"
     set +a
 fi
+
 APPS_ROOT="${APPS_ROOT:-$SCRIPT_DIR/projects}"
+# Default to system python if not specified in project config.env
+# Can override python version there
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # --- ARGUMENT PARSING ---
 
