@@ -11,27 +11,30 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
 fi
 
 APPS_ROOT="${APPS_ROOT:-$SCRIPT_DIR/projects}"
+
 # Default to system python if not specified in project config.env
 # Can override python version there
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # --- ARGUMENT PARSING ---
 
-if [ "$1" == "ps" ]; then
-    COMMAND="ps"
+# List of global commands that DO NOT require a project directory
+if [[ "$1" == "ps" || "$1" == "stop-all" || "$1" == "start-all" ]]; then
+    COMMAND="$1"
+    PROJECT_DIR_ARG="" # Not needed
 elif [ -n "$1" ] && [ -n "$2" ]; then
     PROJECT_DIR_ARG="$1"
     COMMAND="$2"
 else
     echo "Usage:"
-    echo "  Global:  app-ctl ps"
+    echo "  Global:  app-ctl [ps | stop-all | start-all]"
     echo "  Project: app-ctl <project_folder> [up|down|build|run|stop|restart|status|logs]"
     exit 1
 fi
 
 # --- PROJECT CONTEXT LOADING ---
 
-if [ "$COMMAND" != "ps" ]; then
+if [[ "$COMMAND" != "ps" && "$COMMAND" != "stop-all" && "$COMMAND" != "start-all" ]]; then
     if [ ! -d "$PROJECT_DIR_ARG" ]; then
         echo "❌ Error: Project directory '$PROJECT_DIR_ARG' not found."
         exit 1
@@ -54,8 +57,10 @@ if [ "$COMMAND" != "ps" ]; then
         exit 1
     fi
     
+    # Defaults
     APP_NAME=$(echo "$APP_NAME" | tr ' ' '-')
     if [ -z "$APP_DIR" ]; then APP_DIR="."; fi
+    if [ -z "$REQUIRE_PORT" ]; then REQUIRE_PORT="true"; fi # Default to Web App
 
     SYSTEMD_DIR="$HOME/.config/systemd/user"
     SERVICE_FILE="$SYSTEMD_DIR/${APP_NAME}.service"
@@ -64,12 +69,18 @@ fi
 # --- HELPER FUNCTIONS ---
 
 check_port() {
-    # [FIX 2] Explicitly warn if check is skipped
-    if [ -z "$PORT" ]; then 
-        echo "⚠️  Warning: PORT variable not found. Skipping port check."
+    # CASE 1: App is explicitly a background worker/script
+    if [ "$REQUIRE_PORT" == "false" ]; then
         return 0
     fi
 
+    # CASE 2: App NEEDS a port, but user forgot to set it in .env
+    if [ -z "$PORT" ]; then 
+        echo "❌ Error: REQUIRE_PORT=true, but 'PORT' variable is missing in .env."
+        return 1
+    fi
+
+    # CASE 3: Standard Port Check
     # Check for listening ports (both IPv4 and IPv6)
     if ss -tuln | grep -q ":$PORT "; then
         echo "❌ Error: Port $PORT is already in use."
@@ -195,7 +206,10 @@ status() {
         echo "Main PID:       $MAIN_PID"
         echo "Memory Usage:   $MEM_USAGE"
     fi
-    if [ ! -z "$PORT" ]; then
+
+    if [ "$REQUIRE_PORT" == "false" ]; then
+        echo "Port:           N/A (Background Service)"
+    elif [ ! -z "$PORT" ]; then
         if ss -tuln | grep -q ":$PORT "; then
             echo "Port $PORT:      ✅ Listening"
         else
@@ -229,6 +243,62 @@ logs() {
     journalctl --user -u "${APP_NAME}" -f
 }
 
+# --- GLOBAL DASHBOARD COMMANDS ---
+
+stop_all() {
+    echo "--- 🛑 Stopping ALL Managed Services ---"
+    if [ ! -d "$APPS_ROOT" ]; then
+        echo "Error: APPS_ROOT directory '$APPS_ROOT' does not exist."
+        return
+    fi
+    
+    count=0
+    for proj in "$APPS_ROOT"/*; do
+        if [ -d "$proj" ] && [ -f "$proj/config.env" ]; then
+            # Use subshell to protect global variables
+            (
+                source "$proj/config.env"
+                NAME=$(echo "$APP_NAME" | tr ' ' '-')
+                if systemctl --user is-active --quiet "$NAME"; then
+                    printf "Stopping %-25s ... " "$NAME"
+                    systemctl --user stop "$NAME"
+                    echo "✅ Done"
+                else
+                    printf "Skipping %-25s ... (Already Stopped)\n" "$NAME"
+                fi
+            )
+            count=$((count + 1))
+        fi
+    done
+    echo "--- Processed $count apps ---"
+}
+
+start_all() {
+    echo "--- 🚀 Starting ALL Managed Services ---"
+    if [ ! -d "$APPS_ROOT" ]; then
+        echo "Error: APPS_ROOT directory '$APPS_ROOT' does not exist."
+        return
+    fi
+
+    for proj in "$APPS_ROOT"/*; do
+        if [ -d "$proj" ] && [ -f "$proj/config.env" ]; then
+            (
+                source "$proj/config.env"
+                NAME=$(echo "$APP_NAME" | tr ' ' '-')
+                
+                # Check if installed
+                if systemctl --user list-unit-files "${NAME}.service" >/dev/null 2>&1; then
+                    printf "Starting %-25s ... " "$NAME"
+                    systemctl --user start "$NAME"
+                    echo "✅ Triggered"
+                else
+                    printf "Skipping %-25s ... (Not installed/built)\n" "$NAME"
+                fi
+            )
+        fi
+    done
+}
+
 ps_dashboard() {
     echo "-----------------------------------------------------------------------------------------"
     printf "%-25s %-12s %-10s %-8s %-20s\n" "PROJECT ID" "STATUS" "PID" "PORT" "UPTIME"
@@ -242,7 +312,10 @@ ps_dashboard() {
 
     for proj in "$SEARCH_DIR"/*; do
         if [ -d "$proj" ] && [ -f "$proj/config.env" ]; then
+            # Extract Vars from config.env
             RAW_NAME=$(grep '^APP_NAME=' "$proj/config.env" | cut -d '"' -f 2)
+            REQ_PORT=$(grep '^REQUIRE_PORT=' "$proj/config.env" | cut -d '=' -f 2 | tr -d '"')
+            
             NAME=$(echo "$RAW_NAME" | tr ' ' '-')
             RAW_STATUS=$(systemctl --user is-active "$NAME" 2>/dev/null || echo "unknown")
             
@@ -262,9 +335,14 @@ ps_dashboard() {
                 PID=$(systemctl --user show --property MainPID --value "$NAME")
                 UPTIME=$(ps -p "$PID" -o etime= 2>/dev/null | xargs)
             fi
-            if [ -f "$proj/.env" ]; then
+            
+            # Smart Port Display
+            if [ "$REQ_PORT" == "false" ]; then
+                PORT_VAL="N/A"
+            elif [ -f "$proj/.env" ]; then
                 PORT_VAL=$(grep '^PORT=' "$proj/.env" | cut -d '=' -f 2)
             fi
+            
             printf "%-25s %-12s %-10s %-8s %-20s\n" "$NAME" "$DISPLAY_STATUS" "$PID" "$PORT_VAL" "$UPTIME"
         fi
     done
@@ -273,6 +351,7 @@ ps_dashboard() {
 
 # --- DISPATCHER ---
 case "$COMMAND" in
+    # Single App Commands
     up)      up ;;
     down)    down ;;
     build)   build ;;
@@ -281,6 +360,11 @@ case "$COMMAND" in
     restart) restart ;;
     status)  status ;;
     logs)    logs ;;
-    ps)      ps_dashboard ;;
+
+    # Global Commands
+    ps)        ps_dashboard ;;
+    stop-all)  stop_all ;;
+    start-all) start_all ;;
+    
     *)       echo "Unknown command: $COMMAND" ;;
 esac
