@@ -9,6 +9,11 @@ Type=simple
 EnvironmentFile=${INSTALL_DIR}/.env
 Environment=PATH=${INSTALL_DIR}/venv/bin:/usr/local/bin:/usr/bin:/bin
 
+# Force Python to log errors immediately (don't wait for buffer)
+Environment=PYTHONUNBUFFERED=1
+# Prevent Python from creating .pyc files (keeps directories clean)
+Environment=PYTHONDONTWRITEBYTECODE=1
+
 # ExecStart is generic: it runs whatever binary (python, uvicorn, gunicorn)
 # is specified in ENTRYPOINT, with the arguments from ARGS.
 ExecStart=${INSTALL_DIR}/venv/bin/${ENTRYPOINT} ${ARGS}
