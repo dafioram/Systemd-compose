@@ -68,6 +68,45 @@ fi
 
 # --- HELPER FUNCTIONS ---
 
+check_name_collision() {
+    # If the service file doesn't exist, we are safe (new app)
+    if [ ! -f "$SERVICE_FILE" ]; then
+        return 0
+    fi
+
+    # Extract the directory of the CURRENTLY registered service
+    # We look for the "WorkingDirectory=" line in the systemd unit
+    EXISTING_PATH=$(grep '^WorkingDirectory=' "$SERVICE_FILE" | cut -d '=' -f 2)
+    
+    # If we found a path, resolve it to check against our current project
+    if [ -n "$EXISTING_PATH" ]; then
+        # Use realpath to ensure we are comparing absolute paths
+        EXISTING_REAL=$(realpath "$EXISTING_PATH" 2>/dev/null || echo "")
+        CURRENT_REAL=$(realpath "$INSTALL_DIR/$APP_DIR")
+
+        # THE CHECK:
+        # 1. Paths are different (Conflict detected)
+        # 2. The old path still actually exists (It's not a dead/moved project)
+        if [ "$EXISTING_REAL" != "$CURRENT_REAL" ] && [ -d "$EXISTING_REAL" ]; then
+            echo "❌ Error: Name Conflict!"
+            echo "   The app name '$APP_NAME' is already claimed by another active project:"
+            echo "   👉 $EXISTING_REAL"
+            echo ""
+            echo "   To run this instance, you MUST change 'APP_NAME' in:"
+            echo "   $PROJECT_DIR/config.env"
+            echo "   (Example: APP_NAME=\"${APP_NAME}-2\")"
+            return 1
+        fi
+        
+        # If the old path DOES NOT exist, we assume the user moved the folder
+        # and allow the overwrite (Self-Healing).
+        if [ ! -d "$EXISTING_REAL" ] && [ -n "$EXISTING_REAL" ]; then
+            echo "⚠️  Notice: Claiming orphaned service name '$APP_NAME' (Old path missing)."
+        fi
+    fi
+    return 0
+}
+
 check_port() {
     # CASE 1: App is explicitly a background worker/script
     if [ "$REQUIRE_PORT" == "false" ]; then
@@ -131,6 +170,9 @@ build() {
 
 run() {
     echo "--- 🚀 Starting ${APP_NAME} ---"
+    
+    # --- CHECKS ---
+    if ! check_name_collision; then exit 1; fi
     if ! check_port; then exit 1; fi
     if ! check_binary; then exit 1; fi
 
@@ -352,19 +394,19 @@ ps_dashboard() {
 # --- DISPATCHER ---
 case "$COMMAND" in
     # Single App Commands
-    up)      up ;;
-    down)    down ;;
-    build)   build ;;
-    run)     run ;;
-    stop)    stop ;;
-    restart) restart ;;
-    status)  status ;;
-    logs)    logs ;;
+    up)        up ;;
+    down)      down ;;
+    build)     build ;;
+    run|start) run ;;
+    stop)      stop ;;
+    restart)   restart ;;
+    status)    status ;;
+    logs)      logs ;;
 
     # Global Commands
     ps)        ps_dashboard ;;
     stop-all)  stop_all ;;
     start-all) start_all ;;
     
-    *)       echo "Unknown command: $COMMAND" ;;
+    *)         echo "Unknown command: $COMMAND" ;;
 esac
