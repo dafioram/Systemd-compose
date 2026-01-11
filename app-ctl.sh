@@ -13,7 +13,6 @@ fi
 APPS_ROOT="${APPS_ROOT:-$SCRIPT_DIR/projects}"
 
 # Default to system python if not specified in project config.env
-# Can override python version there
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # --- ARGUMENT PARSING ---
@@ -43,7 +42,6 @@ if [[ "$COMMAND" != "ps" && "$COMMAND" != "stop-all" && "$COMMAND" != "start-all
     INSTALL_DIR="$PROJECT_DIR"
     
     # [FIX 1] Robust .env Loading
-    # Handles comments, DOS line endings (\r), and exports automatically
     if [ -f "$PROJECT_DIR/.env" ]; then
         set -a
         source <(sed 's/\r$//' "$PROJECT_DIR/.env" | grep -v '^\s*#')
@@ -60,7 +58,7 @@ if [[ "$COMMAND" != "ps" && "$COMMAND" != "stop-all" && "$COMMAND" != "start-all
     # Defaults
     APP_NAME=$(echo "$APP_NAME" | tr ' ' '-')
     if [ -z "$APP_DIR" ]; then APP_DIR="."; fi
-    if [ -z "$REQUIRE_PORT" ]; then REQUIRE_PORT="true"; fi # Default to Web App
+    if [ -z "$REQUIRE_PORT" ]; then REQUIRE_PORT="true"; fi
 
     SYSTEMD_DIR="$HOME/.config/systemd/user"
     SERVICE_FILE="$SYSTEMD_DIR/${APP_NAME}.service"
@@ -75,18 +73,13 @@ check_name_collision() {
     fi
 
     # Extract the directory of the CURRENTLY registered service
-    # We look for the "WorkingDirectory=" line in the systemd unit
     EXISTING_PATH=$(grep '^WorkingDirectory=' "$SERVICE_FILE" | cut -d '=' -f 2)
     
-    # If we found a path, resolve it to check against our current project
     if [ -n "$EXISTING_PATH" ]; then
-        # Use realpath to ensure we are comparing absolute paths
         EXISTING_REAL=$(realpath "$EXISTING_PATH" 2>/dev/null || echo "")
         CURRENT_REAL=$(realpath "$INSTALL_DIR/$APP_DIR")
 
-        # THE CHECK:
-        # 1. Paths are different (Conflict detected)
-        # 2. The old path still actually exists (It's not a dead/moved project)
+        # THE CHECK: Paths are different AND the old path still exists
         if [ "$EXISTING_REAL" != "$CURRENT_REAL" ] && [ -d "$EXISTING_REAL" ]; then
             echo "❌ Error: Name Conflict!"
             echo "   The app name '$APP_NAME' is already claimed by another active project:"
@@ -98,8 +91,6 @@ check_name_collision() {
             return 1
         fi
         
-        # If the old path DOES NOT exist, we assume the user moved the folder
-        # and allow the overwrite (Self-Healing).
         if [ ! -d "$EXISTING_REAL" ] && [ -n "$EXISTING_REAL" ]; then
             echo "⚠️  Notice: Claiming orphaned service name '$APP_NAME' (Old path missing)."
         fi
@@ -108,19 +99,15 @@ check_name_collision() {
 }
 
 check_port() {
-    # CASE 1: App is explicitly a background worker/script
     if [ "$REQUIRE_PORT" == "false" ]; then
         return 0
     fi
 
-    # CASE 2: App NEEDS a port, but user forgot to set it in .env
     if [ -z "$PORT" ]; then 
         echo "❌ Error: REQUIRE_PORT=true, but 'PORT' variable is missing in .env."
         return 1
     fi
 
-    # CASE 3: Standard Port Check
-    # Check for listening ports (both IPv4 and IPv6)
     if ss -tuln | grep -q ":$PORT "; then
         echo "❌ Error: Port $PORT is already in use."
         echo "   Process blocking this port:"
@@ -144,6 +131,10 @@ check_binary() {
 
 build() {
     echo "--- 🏗️ Building ${APP_NAME} ---"
+    
+    # [FIX] Check for name conflict BEFORE creating venv
+    if ! check_name_collision; then exit 1; fi
+
     $PYTHON_BIN -c "import venv" 2>/dev/null
     if [ $? -ne 0 ]; then
         echo "❌ Error: 'venv' module missing. Run ./host-setup.sh"
@@ -171,7 +162,6 @@ build() {
 run() {
     echo "--- 🚀 Starting ${APP_NAME} ---"
     
-    # --- CHECKS ---
     if ! check_name_collision; then exit 1; fi
     if ! check_port; then exit 1; fi
     if ! check_binary; then exit 1; fi
@@ -189,7 +179,6 @@ run() {
     systemctl --user daemon-reload
     systemctl --user enable "${APP_NAME}"
     
-    # [FIX 3] Capture Systemd Failure
     if ! systemctl --user restart "${APP_NAME}"; then
         echo ""
         echo "❌ Fatal: Systemd failed to start the service."
@@ -216,21 +205,16 @@ stop() {
 
 restart() {
     echo "--- ♻️  Restarting ${APP_NAME} ---"
-    
-    # Check if the service is actually installed
     if ! systemctl --user list-unit-files "${APP_NAME}.service" >/dev/null 2>&1; then
         echo "❌ Service '${APP_NAME}' is not installed."
         echo "   Run 'app-ctl <project> up' first to build and install it."
         exit 1
     fi
 
-    # Trigger restart
     systemctl --user restart "${APP_NAME}"
     
-    # Validate health
     if systemctl --user is-active --quiet "${APP_NAME}"; then
         echo "✅ Restarted successfully."
-        # Show status to verify PID/Port
         status
     else
         echo "❌ Restart Failed. Check logs:"
@@ -241,6 +225,24 @@ restart() {
 status() {
     echo "--- 📊 Status: ${APP_NAME} ---"
     IS_ACTIVE=$(systemctl --user is-active "${APP_NAME}")
+    
+    # [FIX] Detect "Ghost" Services (Same Name, Different Folder)
+    if [ "$IS_ACTIVE" == "active" ]; then
+        RUNNING_DIR=$(systemctl --user show --property WorkingDirectory --value "${APP_NAME}")
+        REAL_RUNNING=$(realpath "$RUNNING_DIR" 2>/dev/null || echo "$RUNNING_DIR")
+        REAL_CURRENT=$(realpath "$INSTALL_DIR/$APP_DIR")
+
+        if [ "$REAL_RUNNING" != "$REAL_CURRENT" ]; then
+            echo "⚠️  WARNING: Service Identity Mismatch!"
+            echo "   Status is 'active', BUT it is running from a DIFFERENT folder:"
+            echo "   👉 $REAL_RUNNING"
+            echo "   (This folder: $REAL_CURRENT)"
+            echo "   You are seeing the status of the OTHER app."
+            echo ""
+            return
+        fi
+    fi
+
     echo "Service State:  $IS_ACTIVE"
     if [ "$IS_ACTIVE" == "active" ]; then
         MAIN_PID=$(systemctl --user show --property MainPID --value "${APP_NAME}")
@@ -297,7 +299,6 @@ stop_all() {
     count=0
     for proj in "$APPS_ROOT"/*; do
         if [ -d "$proj" ] && [ -f "$proj/config.env" ]; then
-            # Use subshell to protect global variables
             (
                 source "$proj/config.env"
                 NAME=$(echo "$APP_NAME" | tr ' ' '-')
@@ -327,14 +328,12 @@ start_all() {
             (
                 source "$proj/config.env"
                 NAME=$(echo "$APP_NAME" | tr ' ' '-')
-                
-                # Check if installed
                 if systemctl --user list-unit-files "${NAME}.service" >/dev/null 2>&1; then
                     printf "Starting %-25s ... " "$NAME"
                     systemctl --user start "$NAME"
                     echo "✅ Triggered"
                 else
-                    printf "Skipping %-25s ... (Not installed/built)\n" "$NAME"
+                    printf "Skipping %-25s ... (Not installed)\n" "$NAME"
                 fi
             )
         fi
@@ -373,12 +372,21 @@ ps_dashboard() {
             UPTIME="-"
             PORT_VAL="-"
 
+            # [FIX] Check for Ghost Services in PS
             if [ "$DISPLAY_STATUS" == "RUNNING" ]; then
-                PID=$(systemctl --user show --property MainPID --value "$NAME")
-                UPTIME=$(ps -p "$PID" -o etime= 2>/dev/null | xargs)
+                RUNNING_DIR=$(systemctl --user show --property WorkingDirectory --value "$NAME")
+                REAL_RUNNING=$(realpath "$RUNNING_DIR" 2>/dev/null || echo "")
+                REAL_CURRENT=$(realpath "$proj")
+                
+                # If the running service does NOT match this folder
+                if [ "$REAL_RUNNING" != "$REAL_CURRENT" ]; then
+                    DISPLAY_STATUS="CONFLICT"
+                else
+                    PID=$(systemctl --user show --property MainPID --value "$NAME")
+                    UPTIME=$(ps -p "$PID" -o etime= 2>/dev/null | xargs)
+                fi
             fi
             
-            # Smart Port Display
             if [ "$REQ_PORT" == "false" ]; then
                 PORT_VAL="N/A"
             elif [ -f "$proj/.env" ]; then
@@ -393,7 +401,6 @@ ps_dashboard() {
 
 # --- DISPATCHER ---
 case "$COMMAND" in
-    # Single App Commands
     up)        up ;;
     down)      down ;;
     build)     build ;;
@@ -402,11 +409,8 @@ case "$COMMAND" in
     restart)   restart ;;
     status)    status ;;
     logs)      logs ;;
-
-    # Global Commands
     ps)        ps_dashboard ;;
     stop-all)  stop_all ;;
     start-all) start_all ;;
-    
     *)         echo "Unknown command: $COMMAND" ;;
 esac
