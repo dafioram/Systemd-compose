@@ -1,0 +1,28 @@
+[Unit]
+Description=${DESCRIPTION}
+After=network.target time-sync.target
+Wants=time-sync.target
+
+[Service]
+Type=simple
+# Load secrets and config from .env
+EnvironmentFile=${INSTALL_DIR}/.env
+Environment=PATH=${INSTALL_DIR}/venv/bin:/usr/local/bin:/usr/bin:/bin
+
+# Force Python to log errors immediately (don't wait for buffer)
+Environment=PYTHONUNBUFFERED=1
+# Prevent Python from creating .pyc files (keeps directories clean)
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# ExecStart is generic: it runs whatever binary (python, uvicorn, gunicorn)
+# is specified in ENTRYPOINT, with the arguments from ARGS.
+ExecStart=${INSTALL_DIR}/venv/bin/${ENTRYPOINT} ${ARGS}
+
+# Working directory can be root (.) or a subfolder (app)
+WorkingDirectory=${INSTALL_DIR}/${APP_DIR}
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
