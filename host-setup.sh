@@ -1,5 +1,13 @@
 #!/bin/bash
 
+# --- OS COMPATIBILITY CHECK ---
+if ! command -v apt-get &> /dev/null; then
+    echo "❌ Error: This script supports Debian/Ubuntu based systems only."
+    echo "   (Raspbian, DietPi, Ubuntu, Mint, etc.)"
+    echo "   Reason: It relies on 'apt' for package management."
+    exit 1
+fi
+
 # Dependencies:
 # python3-venv:      Critical for creating isolated environments
 # python3-pip:       Required for package management
@@ -9,7 +17,8 @@
 # libpam-systemd:    Triggers systemd startup on login
 DEPS=("python3" "python3-venv" "python3-pip" "git" "lsof" "dbus-user-session" "libpam-systemd")
 TARGET_LINK="/usr/local/bin/app-ctl"
-SOURCE_SCRIPT="$(dirname "$(realpath "$0")")/app-ctl.sh"
+SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+SOURCE_SCRIPT="$SCRIPT_DIR/app-ctl.sh"
 
 echo "=== 🛠️  Host Dependency Check ==="
 
@@ -46,6 +55,14 @@ if [ ${#MISSING_DEPS[@]} -ne 0 ]; then
     fi
 else
     echo "✅ All system packages installed."
+fi
+
+# --- CHECK: PYTHON FUNCTIONALITY ---
+# Packages might be installed but broken. Verify we can actually invoke python.
+if ! python3 -c "import venv" 2>/dev/null; then
+    echo "❌ Error: Python 3 is installed, but the 'venv' module is broken."
+    echo "   Run: sudo apt install --reinstall python3-venv"
+    # Don't exit, let the user decide if they want to continue
 fi
 
 # --- HELPER: FIX DIETPI / MINIMAL LOGIND ---
@@ -137,9 +154,16 @@ else
     echo "✅ Systemd Linger is enabled."
 fi
 
-# --- ACTION: SYMLINK ---
+# --- ACTION: SYMLINK & PERMISSIONS ---
 
 echo "--- 🔗 Symlink Setup ---"
+
+# Ensure the main script is executable
+if [ ! -x "$SOURCE_SCRIPT" ]; then
+    echo "🔧 Making app-ctl.sh executable..."
+    chmod +x "$SOURCE_SCRIPT"
+fi
+
 if [ -L "$TARGET_LINK" ]; then
     CURRENT_DEST=$(readlink -f "$TARGET_LINK")
     if [ "$CURRENT_DEST" == "$SOURCE_SCRIPT" ]; then
