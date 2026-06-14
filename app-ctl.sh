@@ -132,7 +132,7 @@ check_binary() {
 build() {
     echo "--- 🏗️ Building ${APP_NAME} ---"
     
-    # [FIX] Check for name conflict BEFORE creating venv
+    # Check for name conflict BEFORE creating venv
     if ! check_name_collision; then exit 1; fi
 
     $PYTHON_BIN -c "import venv" 2>/dev/null
@@ -226,7 +226,7 @@ status() {
     echo "--- 📊 Status: ${APP_NAME} ---"
     IS_ACTIVE=$(systemctl --user is-active "${APP_NAME}")
     
-    # [FIX] Detect "Ghost" Services (Same Name, Different Folder)
+    # Detect "Ghost" Services (Same Name, Different Folder)
     if [ "$IS_ACTIVE" == "active" ]; then
         RUNNING_DIR=$(systemctl --user show --property WorkingDirectory --value "${APP_NAME}")
         REAL_RUNNING=$(realpath "$RUNNING_DIR" 2>/dev/null || echo "$RUNNING_DIR")
@@ -255,9 +255,9 @@ status() {
         echo "Port:           N/A (Background Service)"
     elif [ ! -z "$PORT" ]; then
         if ss -tuln | grep -q ":$PORT "; then
-            echo "Port $PORT:      ✅ Listening"
+            echo "Port $PORT:       ✅ Listening"
         else
-            echo "Port $PORT:      ❌ Not Listening"
+            echo "Port $PORT:       ❌ Not Listening"
         fi
     fi
     echo ""
@@ -287,115 +287,137 @@ logs() {
     journalctl --user -u "${APP_NAME}" -f
 }
 
+# --- GLOBAL DASHBOARD DISCOVERY ---
+
+get_all_projects() {
+    local paths=()
+
+    # 1. Grab everything from your default APPS_ROOT
+    if [ -d "$APPS_ROOT" ]; then
+        for proj in "$APPS_ROOT"/*; do
+            if [ -d "$proj" ] && [ -f "$proj/config.env" ]; then
+                paths+=("$(realpath "$proj" 2>/dev/null)")
+            fi
+        done
+    fi
+
+    # 2. Scrape systemd for orphaned/external projects
+    local systemd_dir="$HOME/.config/systemd/user"
+    if [ -d "$systemd_dir" ]; then
+        for svc in "$systemd_dir"/*.service; do
+            [ -f "$svc" ] || continue
+            
+            local env_file=$(grep '^EnvironmentFile=' "$svc" | cut -d '=' -f 2)
+            if [ -n "$env_file" ]; then
+                local proj_dir="${env_file%/.env}"
+                if [ -d "$proj_dir" ] && [ -f "$proj_dir/config.env" ]; then
+                    paths+=("$(realpath "$proj_dir" 2>/dev/null)")
+                fi
+            fi
+        done
+    fi
+
+    # Deduplicate the list and print it safely
+    if [ ${#paths[@]} -gt 0 ]; then
+        printf "%s\n" "${paths[@]}" | sort -u
+    fi
+}
+
 # --- GLOBAL DASHBOARD COMMANDS ---
 
 stop_all() {
     echo "--- 🛑 Stopping ALL Managed Services ---"
-    if [ ! -d "$APPS_ROOT" ]; then
-        echo "Error: APPS_ROOT directory '$APPS_ROOT' does not exist."
-        return
-    fi
+    local count=0
     
-    count=0
-    for proj in "$APPS_ROOT"/*; do
-        if [ -d "$proj" ] && [ -f "$proj/config.env" ]; then
-            (
-                source "$proj/config.env"
-                NAME=$(echo "$APP_NAME" | tr ' ' '-')
-                if systemctl --user is-active --quiet "$NAME"; then
-                    printf "Stopping %-25s ... " "$NAME"
-                    systemctl --user stop "$NAME"
-                    echo "✅ Done"
-                else
-                    printf "Skipping %-25s ... (Already Stopped)\n" "$NAME"
-                fi
-            )
-            count=$((count + 1))
-        fi
-    done
+    while IFS= read -r proj; do
+        [ -z "$proj" ] && continue
+        (
+            source "$proj/config.env"
+            NAME=$(echo "$APP_NAME" | tr ' ' '-')
+            if systemctl --user is-active --quiet "$NAME"; then
+                printf "Stopping %-25s ... " "$NAME"
+                systemctl --user stop "$NAME"
+                echo "✅ Done"
+            else
+                printf "Skipping %-25s ... (Already Stopped)\n" "$NAME"
+            fi
+        )
+        count=$((count + 1))
+    done < <(get_all_projects)
+    
     echo "--- Processed $count apps ---"
 }
 
 start_all() {
     echo "--- 🚀 Starting ALL Managed Services ---"
-    if [ ! -d "$APPS_ROOT" ]; then
-        echo "Error: APPS_ROOT directory '$APPS_ROOT' does not exist."
-        return
-    fi
-
-    for proj in "$APPS_ROOT"/*; do
-        if [ -d "$proj" ] && [ -f "$proj/config.env" ]; then
-            (
-                source "$proj/config.env"
-                NAME=$(echo "$APP_NAME" | tr ' ' '-')
-                if systemctl --user list-unit-files "${NAME}.service" >/dev/null 2>&1; then
-                    printf "Starting %-25s ... " "$NAME"
-                    systemctl --user start "$NAME"
-                    echo "✅ Triggered"
-                else
-                    printf "Skipping %-25s ... (Not installed)\n" "$NAME"
-                fi
-            )
-        fi
-    done
+    
+    while IFS= read -r proj; do
+        [ -z "$proj" ] && continue
+        (
+            source "$proj/config.env"
+            NAME=$(echo "$APP_NAME" | tr ' ' '-')
+            if systemctl --user list-unit-files "${NAME}.service" >/dev/null 2>&1; then
+                printf "Starting %-25s ... " "$NAME"
+                systemctl --user start "$NAME"
+                echo "✅ Triggered"
+            else
+                printf "Skipping %-25s ... (Not installed)\n" "$NAME"
+            fi
+        )
+    done < <(get_all_projects)
 }
 
 ps_dashboard() {
     echo "-----------------------------------------------------------------------------------------"
     printf "%-25s %-12s %-10s %-8s %-20s\n" "PROJECT ID" "STATUS" "PID" "PORT" "UPTIME"
     echo "-----------------------------------------------------------------------------------------"
-    
-    SEARCH_DIR="$APPS_ROOT"
-    if [ ! -d "$SEARCH_DIR" ]; then
-        echo "Error: APPS_ROOT directory '$SEARCH_DIR' does not exist."
-        return
-    fi
 
-    for proj in "$SEARCH_DIR"/*; do
-        if [ -d "$proj" ] && [ -f "$proj/config.env" ]; then
-            # Extract Vars from config.env
-            RAW_NAME=$(grep '^APP_NAME=' "$proj/config.env" | cut -d '"' -f 2)
-            REQ_PORT=$(grep '^REQUIRE_PORT=' "$proj/config.env" | cut -d '=' -f 2 | tr -d '"')
-            
-            NAME=$(echo "$RAW_NAME" | tr ' ' '-')
-            RAW_STATUS=$(systemctl --user is-active "$NAME" 2>/dev/null || echo "unknown")
-            
-            case "$RAW_STATUS" in
-                active)      DISPLAY_STATUS="RUNNING" ;;
-                inactive)    DISPLAY_STATUS="STOPPED" ;;
-                unknown)     DISPLAY_STATUS="UNREGISTERED" ;;
-                failed)      DISPLAY_STATUS="CRASHED" ;;
-                *)           DISPLAY_STATUS="$RAW_STATUS" ;;
-            esac
-            
-            PID="-"
-            UPTIME="-"
-            PORT_VAL="-"
+    while IFS= read -r proj; do
+        [ -z "$proj" ] && continue
+        
+        # Extract Vars from config.env
+        RAW_NAME=$(grep '^APP_NAME=' "$proj/config.env" | cut -d '"' -f 2)
+        REQ_PORT=$(grep '^REQUIRE_PORT=' "$proj/config.env" | cut -d '=' -f 2 | tr -d '"')
+        
+        NAME=$(echo "$RAW_NAME" | tr ' ' '-')
+        RAW_STATUS=$(systemctl --user is-active "$NAME" 2>/dev/null || echo "unknown")
+        
+        case "$RAW_STATUS" in
+            active)    DISPLAY_STATUS="RUNNING" ;;
+            inactive)  DISPLAY_STATUS="STOPPED" ;;
+            unknown)   DISPLAY_STATUS="UNREGISTERED" ;;
+            failed)    DISPLAY_STATUS="CRASHED" ;;
+            *)         DISPLAY_STATUS="$RAW_STATUS" ;;
+        esac
+        
+        PID="-"
+        UPTIME="-"
+        PORT_VAL="-"
 
-            # [FIX] Check for Ghost Services in PS
-            if [ "$DISPLAY_STATUS" == "RUNNING" ]; then
-                RUNNING_DIR=$(systemctl --user show --property WorkingDirectory --value "$NAME")
-                REAL_RUNNING=$(realpath "$RUNNING_DIR" 2>/dev/null || echo "")
-                REAL_CURRENT=$(realpath "$proj")
-                
-                # If the running service does NOT match this folder
-                if [ "$REAL_RUNNING" != "$REAL_CURRENT" ]; then
-                    DISPLAY_STATUS="CONFLICT"
-                else
-                    PID=$(systemctl --user show --property MainPID --value "$NAME")
-                    UPTIME=$(ps -p "$PID" -o etime= 2>/dev/null | xargs)
-                fi
-            fi
+        # Check for Ghost Services in PS
+        if [ "$DISPLAY_STATUS" == "RUNNING" ]; then
+            RUNNING_DIR=$(systemctl --user show --property WorkingDirectory --value "$NAME")
+            REAL_RUNNING=$(realpath "$RUNNING_DIR" 2>/dev/null || echo "")
+            REAL_CURRENT=$(realpath "$proj")
             
-            if [ "$REQ_PORT" == "false" ]; then
-                PORT_VAL="N/A"
-            elif [ -f "$proj/.env" ]; then
-                PORT_VAL=$(grep '^PORT=' "$proj/.env" | cut -d '=' -f 2)
+            # If the running service does NOT match this folder
+            if [[ "$REAL_RUNNING" != "$REAL_CURRENT"* ]]; then
+                DISPLAY_STATUS="CONFLICT"
+            else
+                PID=$(systemctl --user show --property MainPID --value "$NAME")
+                UPTIME=$(ps -p "$PID" -o etime= 2>/dev/null | xargs)
             fi
-            
-            printf "%-25s %-12s %-10s %-8s %-20s\n" "$NAME" "$DISPLAY_STATUS" "$PID" "$PORT_VAL" "$UPTIME"
         fi
-    done
+        
+        if [ "$REQ_PORT" == "false" ]; then
+            PORT_VAL="N/A"
+        elif [ -f "$proj/.env" ]; then
+            PORT_VAL=$(grep '^PORT=' "$proj/.env" | cut -d '=' -f 2)
+        fi
+        
+        printf "%-25s %-12s %-10s %-8s %-20s\n" "$NAME" "$DISPLAY_STATUS" "$PID" "$PORT_VAL" "$UPTIME"
+        
+    done < <(get_all_projects)
     echo "-----------------------------------------------------------------------------------------"
 }
 

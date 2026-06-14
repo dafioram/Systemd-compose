@@ -12,10 +12,10 @@ fi
 # python3-venv:      Critical for creating isolated environments
 # python3-pip:       Required for package management
 # git:               Version control
-# lsof:              Used to check for blocking ports
+# lsof / iproute2:   Used to check for blocking ports (lsof + ss)
 # dbus-user-session: REQUIRED for 'systemctl --user' on minimal distros (DietPi)
 # libpam-systemd:    Triggers systemd startup on login
-DEPS=("python3" "python3-venv" "python3-pip" "git" "lsof" "dbus-user-session" "libpam-systemd")
+DEPS=("python3" "python3-venv" "python3-pip" "git" "lsof" "iproute2" "dbus-user-session" "libpam-systemd")
 TARGET_LINK="/usr/local/bin/app-ctl"
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 SOURCE_SCRIPT="$SCRIPT_DIR/app-ctl.sh"
