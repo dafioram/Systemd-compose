@@ -1,13 +1,18 @@
 [Unit]
 Description=${DESCRIPTION}
-After=network.target time-sync.target
-Wants=time-sync.target
+# Note: user services cannot wait for system targets such as network.target,
+# so apps should retry their network connections on startup.
+
+# Stop restarting (state "failed", shown as CRASHED) after 5 starts in 2 minutes
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
-Type=simple
+# "exec" reports a missing or broken binary as a failed start
+Type=exec
 # Load secrets and config from .env (the leading "-" makes the file optional)
 EnvironmentFile=-${INSTALL_DIR}/.env
-Environment=PATH=${INSTALL_DIR}/venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment="PATH=${INSTALL_DIR}/venv/bin:/usr/local/bin:/usr/bin:/bin"
 
 # Force Python to log errors immediately (don't wait for buffer)
 Environment=PYTHONUNBUFFERED=1
@@ -16,12 +21,13 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 
 # ExecStart is generic: it runs whatever binary (python, uvicorn, gunicorn)
 # is specified in ENTRYPOINT, with the arguments from ARGS.
-ExecStart=${INSTALL_DIR}/venv/bin/${ENTRYPOINT} ${ARGS}
+ExecStart="${INSTALL_DIR}/venv/bin/${ENTRYPOINT}" ${ARGS}
 
 # Working directory can be root (.) or a subfolder (app)
 WorkingDirectory=${INSTALL_DIR}/${APP_DIR}
 
-Restart=always
+# Restart after crashes, not after a clean exit or `systemd-compose stop`
+Restart=on-failure
 RestartSec=5
 
 [Install]
