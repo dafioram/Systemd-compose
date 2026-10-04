@@ -1,0 +1,4 @@
+#!/bin/bash
+# Fake journalctl for tests: records the call instead of reading logs.
+echo "journalctl $*" >> "${STUB_STATE:?}/calls"
+echo "[journal: $*]"

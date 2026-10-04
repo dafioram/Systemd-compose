@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats
+        run: sudo apt-get update -q && sudo apt-get install -y -q bats
+
+      - name: ShellCheck
+        run: shellcheck systemd-compose.sh host-setup.sh tests/stubs/* tests/test_helper.bash tests/*.bats
+
+      - name: Tests
+        run: bats tests

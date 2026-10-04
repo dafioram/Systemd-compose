@@ -1,0 +1,10 @@
+#!/bin/bash
+# Fake `ss -tuln` for tests: lists the ports recorded in $STUB_STATE/ports
+# (written by stubs/systemctl when an app "starts" with STUB_LISTEN set).
+echo "Netid State  Recv-Q Send-Q Local Address:Port Peer Address:Port"
+if [ -f "${STUB_STATE:?}/ports" ]; then
+    while read -r port _; do
+        echo "tcp   LISTEN 0      128          0.0.0.0:$port        0.0.0.0:*"
+    done < "$STUB_STATE/ports"
+fi
+exit 0

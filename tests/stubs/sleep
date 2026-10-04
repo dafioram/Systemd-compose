@@ -1,0 +1,3 @@
+#!/bin/bash
+# Fake sleep for tests: the startup check polls once per second; don't wait.
+exit 0
