@@ -13,7 +13,7 @@ Get the developer experience of Docker without the resource cost.
 | **Isolation** | Heavy (Container Virtualization) | Light (Venv / Native Process) |
 | **RAM Usage** | High (Daemon + Container Overhead) | **Near Zero** (Native OS usage only) |
 | **Disk Space** | Heavy (Duplicated OS layers) | **Tiny** (Shared OS libs) |
-| **Management** | `docker compose up` | `systemd-compose . up` |
+| **Management** | `docker compose up` | `systemd-compose up` |
 | **Best For** | Cloud / Complex Deps | Raspberry Pi / Home Lab / Old PCs |
 
 ---
@@ -21,10 +21,11 @@ Get the developer experience of Docker without the resource cost.
 ## ✨ Features
 
 * **Rootless Architecture:** Runs entirely in userspace using `systemd --user`.
-* **Docker-like CLI:** Commands like `up`, `down`, `ps`, and `logs` make it easy to learn.
+* **Docker-like CLI:** Commands like `up`, `down`, `ps`, `logs` and `exec` make it easy to learn.
 * **Isolated Environments:** Automatically creates and manages a Python `venv` for each project.
 * **Namespaced Services:** Every app runs as `sdc-<APP_NAME>.service`, so it can never replace one of your other user services.
 * **Conflict Detection:** Prevents two project folders from claiming the same app name.
+* **Resource Limits:** Cap an app's memory and CPU so one runaway app can't take down your Pi.
 * **Crash Detection:** `up` waits until your app is actually running (and listening on its port) and shows the logs if it isn't. Crash loops end as **CRASHED** instead of restarting forever.
 * **Global Dashboard:** `ps` shows every app you've started, wherever its project folder lives.
 * **Flexible:** Runs anything installed in the venv: plain Python scripts, Uvicorn (FastAPI), Gunicorn (Flask/Django), or `python -m http.server` for a static site.
@@ -81,10 +82,10 @@ cd ~/my-new-bot
 nano config.env        # set APP_NAME="my-new-bot"
 
 # Create the venv, install requirements.txt, install and start the service
-systemd-compose . up
+systemd-compose up
 
 systemd-compose ps     # see all apps
-systemd-compose . logs # follow this app's output (Ctrl+C to exit)
+systemd-compose logs   # follow this app's output (Ctrl+C to exit)
 ```
 
 ---
@@ -141,6 +142,8 @@ REQUIRE_PORT="false"
 | `REQUIRE_PORT` | No | `true` (default) or `false`. See above. |
 | `PYTHON_BIN` | No | Python used to create the venv. Default `python3`. Delete `venv/` and run `build` after changing it. |
 | `STARTUP_TIMEOUT` | No | Seconds to wait for the port to start listening. Default `15`. |
+| `MEMORY_MAX` | No | Memory limit for the app and all its workers, e.g. `300M`, `1G` or `25%` of RAM. Above it, the app is killed and restarted. Default: no limit. |
+| `CPU_QUOTA` | No | CPU limit as a percentage of one core, e.g. `50%`, or `200%` for two cores. Default: no limit. |
 
 `config.env` can use `${INSTALL_DIR}` (the project folder), `${APP_DIR}`, and any value from `.env`, such as `$PORT`.
 
@@ -170,20 +173,27 @@ Use systemd's format:
 
 ### Project Commands
 
-Run these with the path to a project folder (`.` for the current folder).
+Run these inside a project folder, or put the folder first: `systemd-compose ~/my-app up`.
 
 | Command | Description |
 | --- | --- |
-| `systemd-compose . up` | **Recommended.** `build` + `run` (like `docker compose up`). |
-| `systemd-compose . build` | Creates the `venv` and installs `requirements.txt`. Stops if `pip` fails. |
-| `systemd-compose . run` | Writes the service file and (re)starts the app, then waits until it is running. Safe to re-run while the app is running. |
-| `systemd-compose . restart` | Restarts the app with the existing service file. Picks up `.env` changes. |
-| `systemd-compose . stop` | Stops the app (keeps the venv and logs). It still starts again at boot. |
-| `systemd-compose . down` | Stops the app, removes the service, and **deletes the venv**. |
-| `systemd-compose . status` | State, PID, memory of all workers, restart count, port and recent log lines. |
-| `systemd-compose . logs` | Follows the app's logs. |
+| `systemd-compose up` | **Recommended.** `build` + `run` (like `docker compose up`). |
+| `systemd-compose build` | Creates the `venv` and installs `requirements.txt`. Stops if `pip` fails. |
+| `systemd-compose run` | Writes the service file and (re)starts the app, then waits until it is running. Safe to re-run while the app is running. |
+| `systemd-compose restart` | Restarts the app with the existing service file. Picks up `.env` changes. |
+| `systemd-compose stop` | Stops the app (keeps the venv and logs). It still starts again at boot. |
+| `systemd-compose down` | Stops the app and removes the service. Keeps the venv, so the next `up` is fast. |
+| `systemd-compose down --volumes` | Same, and also **deletes the venv**. |
+| `systemd-compose status` | State, PID, memory of all workers (and the limit), restart count, port and recent log lines. |
+| `systemd-compose logs` | Follows the app's logs. Add journalctl options to change that: `logs -n 200`, `logs --since "1 hour ago"`, `logs --since today -f`. |
+| `systemd-compose exec <command>` | Runs a one-off command like the app runs: venv first on `PATH`, variables from `.env`, inside `APP_DIR`. E.g. `exec python manage.py migrate`, `exec pip list`, `exec python` for a shell. |
+| `systemd-compose config` | Prints the service file `run` would write, and whether the installed one is out of date. Changes nothing. |
 
-**`run` or `restart`?** Values in `config.env` (including `$PORT` in `ARGS`) are written into the service file. After changing `config.env` or `PORT`, use `run` or `up`. For other `.env` changes, `restart` is enough.
+`systemd-compose --help` lists all commands.
+
+To manage a project folder whose name matches a command (e.g. a folder called `logs`), write it as a path: `systemd-compose ./logs up`.
+
+**`run` or `restart`?** Values in `config.env` (including `$PORT` in `ARGS`) are written into the service file. After changing `config.env` or `PORT`, use `run` or `up`. For other `.env` changes, `restart` is enough. Not sure? `systemd-compose config` tells you whether the service file is out of date.
 
 ### Global Commands
 
@@ -237,6 +247,17 @@ ARGS="-c ${INSTALL_DIR}/${APP_DIR}/gunicorn.conf.py --bind 0.0.0.0:$PORT"
 
 * Wrap an argument containing spaces in quotes, e.g. `ARGS="--name 'My App'"`.
 * `%` and `$` are passed through literally (systemd-compose escapes them), so a log format like `'%(h)s %(r)s'` is safe.
+
+### Resource Limits
+
+```bash
+MEMORY_MAX="300M"   # the app and all its workers together
+CPU_QUOTA="50%"     # half of one CPU core
+```
+
+Run `systemd-compose run` to apply. `status` shows memory use next to the limit. An app that goes over `MEMORY_MAX` is killed and restarted, so set it well above normal use.
+
+Limits need the kernel's memory/CPU controllers to be available to user services (cgroup v2, the default on current Debian, Ubuntu and Raspberry Pi OS). If they aren't, `run` warns that the limit won't be enforced.
 
 ### Startup Check & Crash Handling
 
@@ -306,7 +327,7 @@ CI runs both on every pull request.
 
 ```bash
 # Remove each app (run in each project folder)
-systemd-compose . down
+systemd-compose down --volumes
 
 # Remove the command
 sudo rm /usr/local/bin/systemd-compose
