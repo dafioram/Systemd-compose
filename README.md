@@ -55,7 +55,7 @@ The script asks before changing anything. It:
 
 1. Installs missing packages: `python3`, `python3-venv`, `python3-pip`, `git`, `lsof`, `iproute2`, `dbus-user-session`, `libpam-systemd`.
 2. Fixes minimal systems such as DietPi (masked `systemd-logind`, missing `XDG_RUNTIME_DIR`).
-3. Offers to add you to the `systemd-journal` group, so `logs` and `status` can show your apps' output on systems that don't keep a per-user journal. This group can read **all** system logs.
+3. Makes sure `logs` and `status` can show your apps' output. If the system journal is kept only in memory (common on DietPi and other minimal images), you can't read your own apps' logs. The script offers to store the journal on disk (`/etc/systemd/journald.conf.d/99-systemd-compose.conf`), after which each user can read their own logs. If you decline, it offers the `systemd-journal` group instead, which can read **all** system logs.
 4. Enables **linger** for your user, so apps start at boot and keep running after you log out.
 5. Links `systemd-compose` into `/usr/local/bin`.
 
@@ -303,7 +303,7 @@ systemctl --user daemon-reload
 | `Name Conflict!` | Another project folder already uses this `APP_NAME`. Change `APP_NAME` in this project's `config.env`. |
 | `Port 8000 is already in use` | Another program (or another app) is listening on `PORT`. Change `PORT` in `.env`, or stop the other program. |
 | `running but not listening on port …` | The app started but isn't using `$PORT`. Check `ARGS` binds to `$PORT`, or raise `STARTUP_TIMEOUT`. |
-| `logs` shows nothing / "No journal files were found" | Accept the `systemd-journal` group in `host-setup.sh`, then log out and back in. |
+| `logs` shows nothing / "No journal files were found" | Re-run `./host-setup.sh` and accept storing the journal on disk. Check with `systemd-analyze cat-config systemd/journald.conf \| grep Storage=`: it should end with `persistent`, or with `auto` while `/var/log/journal` exists. If you chose the `systemd-journal` group instead, log out and back in. |
 | Apps stop when you log out / don't start at boot | Linger is off. Run `loginctl enable-linger $USER`. |
 | `Failed to connect to bus` | Re-run `./host-setup.sh` and open a new shell. |
 
