@@ -7,21 +7,17 @@ SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 TEMPLATE_FILE="$SCRIPT_DIR/templates/service.unit"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 
-if [ -f "$SCRIPT_DIR/.env" ]; then
-    set -a +u
-    # shellcheck source=/dev/null
-    source "$SCRIPT_DIR/.env"
-    set +a -u
-fi
-
-APPS_ROOT="${APPS_ROOT:-$SCRIPT_DIR/projects}"
+# Every service systemd-compose creates is named "sdc-<APP_NAME>.service".
+# The prefix keeps apps from clashing with other user services and lets
+# ps/stop-all/start-all find them without scanning project folders.
+UNIT_PREFIX="sdc-"
 
 # Default to system python if not specified in project config.env
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # Keys a project .env may not set inside systemd-compose itself
 # (they would change how this script runs, not just the app).
-RESERVED_ENV_KEYS=" PATH HOME USER SHELL IFS PWD OLDPWD UID EUID PPID SHLVL SCRIPT_DIR TEMPLATE_FILE SYSTEMD_DIR APPS_ROOT PROJECT_DIR INSTALL_DIR SERVICE_FILE UNIT COMMAND "
+RESERVED_ENV_KEYS=" PATH HOME USER SHELL IFS PWD OLDPWD UID EUID PPID SHLVL SCRIPT_DIR TEMPLATE_FILE SYSTEMD_DIR UNIT_PREFIX PROJECT_DIR INSTALL_DIR SERVICE_FILE UNIT COMMAND "
 
 # --- HELPER FUNCTIONS ---
 
@@ -97,6 +93,14 @@ load_project_config() {
     fi
 }
 
+# Reads an "X-SDC-<key>=" line that render_unit wrote into a service file.
+# systemd ignores X- keys; systemd-compose uses them to map services to projects.
+unit_meta() {
+    local value
+    value=$(grep -m1 "^X-SDC-$2=" "$1" 2>/dev/null | cut -d '=' -f 2-)
+    echo "${value//%%/%}"
+}
+
 valid_app_name() {
     [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
 }
@@ -139,7 +143,7 @@ if [[ "$COMMAND" != "ps" && "$COMMAND" != "stop-all" && "$COMMAND" != "start-all
         die "APP_NAME '$APP_NAME' in $PROJECT_DIR/config.env is invalid. Use letters, digits, '-', '_' or '.' (spaces become '-')."
     fi
 
-    UNIT="$APP_NAME"
+    UNIT="${UNIT_PREFIX}${APP_NAME}"
     SERVICE_FILE="$SYSTEMD_DIR/${UNIT}.service"
 fi
 
@@ -149,18 +153,15 @@ check_name_collision() {
         return 0
     fi
 
-    # Extract the directory of the CURRENTLY registered service
-    EXISTING_PATH=$(grep '^WorkingDirectory=' "$SERVICE_FILE" | cut -d '=' -f 2-)
+    # The project folder that installed the existing service
+    local existing
+    existing=$(unit_meta "$SERVICE_FILE" Project)
 
-    if [ -n "$EXISTING_PATH" ]; then
-        EXISTING_REAL=$(realpath "$EXISTING_PATH" 2>/dev/null || echo "")
-        CURRENT_REAL=$(realpath "$INSTALL_DIR/$APP_DIR" 2>/dev/null || echo "$INSTALL_DIR/$APP_DIR")
-
-        # THE CHECK: Paths are different AND the old path still exists
-        if [ "$EXISTING_REAL" != "$CURRENT_REAL" ] && [ -d "$EXISTING_REAL" ]; then
+    if [ -n "$existing" ] && [ "$existing" != "$PROJECT_DIR" ]; then
+        if [ -d "$existing" ]; then
             echo "❌ Error: Name Conflict!"
-            echo "   The app name '$APP_NAME' is already claimed by another active project:"
-            echo "   👉 $EXISTING_REAL"
+            echo "   The app name '$APP_NAME' is already used by another project:"
+            echo "   👉 $existing"
             echo ""
             echo "   To manage this project, you MUST change 'APP_NAME' in:"
             echo "   $PROJECT_DIR/config.env"
@@ -168,8 +169,8 @@ check_name_collision() {
             return 1
         fi
 
-        if [ ! -d "$EXISTING_REAL" ] && [[ "$COMMAND" == "up" || "$COMMAND" == "run" || "$COMMAND" == "start" ]]; then
-            echo "⚠️  Notice: Claiming orphaned service name '$APP_NAME' (Old path missing)."
+        if [[ "$COMMAND" == "up" || "$COMMAND" == "run" || "$COMMAND" == "start" ]]; then
+            echo "⚠️  Notice: Claiming orphaned service name '$APP_NAME' ($existing no longer exists)."
         fi
     fi
     return 0
@@ -227,6 +228,12 @@ check_binary() {
 # characters such as "&" or "|" can't corrupt the file the way sed did.
 render_unit() {
     local var value line key
+    # Only record a port in the service file when the app is meant to use one
+    local PORT="$PORT"
+    if [ "$REQUIRE_PORT" == "false" ]; then
+        PORT=""
+    fi
+
     for var in DESCRIPTION INSTALL_DIR ENTRYPOINT APP_DIR ARGS; do
         if [[ "${!var}" == *$'\n'* ]]; then
             die "$var in config.env must be a single line."
@@ -238,7 +245,7 @@ render_unit() {
 
     while IFS= read -r line || [ -n "$line" ]; do
         key="${line%%=*}"
-        for var in DESCRIPTION INSTALL_DIR ENTRYPOINT APP_DIR ARGS; do
+        for var in DESCRIPTION INSTALL_DIR ENTRYPOINT APP_DIR ARGS PORT; do
             value="${!var}"
             value="${value//%/%%}"
             if [ "$key" == "ExecStart" ]; then
@@ -463,138 +470,104 @@ logs() {
 
 # --- GLOBAL DASHBOARD COMMANDS ---
 
-# Prints "NAME|WORKING_DIR|REQUIRE_PORT|PORT" for a project folder,
-# loading its config in a subshell so nothing leaks between projects.
-project_summary() {
-    (
-        APP_NAME="" APP_DIR="" REQUIRE_PORT="" PORT=""
-        load_project_config "$1" >/dev/null 2>&1
-        echo "${APP_NAME}|$1/${APP_DIR}|${REQUIRE_PORT}|${PORT}"
-    )
-}
-
-# Prints each project folder under APPS_ROOT that has a config.env
-list_projects() {
-    if [ ! -d "$APPS_ROOT" ]; then
-        die "APPS_ROOT directory '$APPS_ROOT' does not exist."
-    fi
-    local proj
-    for proj in "$APPS_ROOT"/*/; do
-        proj="${proj%/}"
-        if [ -f "$proj/config.env" ]; then
-            echo "$proj"
+# Prints the path of every service file systemd-compose has installed
+managed_service_files() {
+    local file
+    for file in "$SYSTEMD_DIR/${UNIT_PREFIX}"*.service; do
+        if [ -f "$file" ]; then
+            echo "$file"
         fi
     done
 }
 
+# "sdc-my-app.service" -> "sdc-my-app"
+unit_from_file() {
+    basename "$1" .service
+}
+
 stop_all() {
     echo "--- 🛑 Stopping ALL Managed Services ---"
-    local projects proj name count=0
-    projects=$(list_projects) || exit 1
-
-    while IFS= read -r proj; do
-        [ -n "$proj" ] || continue
-        IFS='|' read -r name _ _ _ <<< "$(project_summary "$proj")"
-        if ! valid_app_name "$name"; then
-            printf "Skipping %-25s ... (Invalid APP_NAME)\n" "$(basename "$proj")"
-        elif [ -f "$SYSTEMD_DIR/${name}.service" ]; then
-            printf "Stopping %-25s ... " "$name"
-            if systemctl --user stop "${name}.service"; then
-                echo "✅ Done"
-            else
-                echo "❌ Failed"
-            fi
+    local file unit count=0
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        unit=$(unit_from_file "$file")
+        printf "Stopping %-25s ... " "${unit#"$UNIT_PREFIX"}"
+        # Always stop: an app in a crash loop is "activating", not "active".
+        if systemctl --user stop "${unit}.service"; then
+            echo "✅ Done"
         else
-            printf "Skipping %-25s ... (Not installed)\n" "$name"
+            echo "❌ Failed"
         fi
         count=$((count + 1))
-    done <<< "$projects"
+    done <<< "$(managed_service_files)"
     echo "--- Processed $count apps ---"
 }
 
 start_all() {
     echo "--- 🚀 Starting ALL Managed Services ---"
-    local projects proj name
-    projects=$(list_projects) || exit 1
-
-    while IFS= read -r proj; do
-        [ -n "$proj" ] || continue
-        IFS='|' read -r name _ _ _ <<< "$(project_summary "$proj")"
-        if valid_app_name "$name" && [ -f "$SYSTEMD_DIR/${name}.service" ]; then
-            printf "Starting %-25s ... " "$name"
-            systemctl --user reset-failed "${name}.service" 2>/dev/null
-            if systemctl --user start "${name}.service"; then
-                echo "✅ Triggered"
-            else
-                echo "❌ Failed"
-            fi
+    local file unit count=0
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        unit=$(unit_from_file "$file")
+        printf "Starting %-25s ... " "${unit#"$UNIT_PREFIX"}"
+        systemctl --user reset-failed "${unit}.service" 2>/dev/null
+        if systemctl --user start "${unit}.service"; then
+            echo "✅ Triggered"
         else
-            printf "Skipping %-25s ... (Not installed)\n" "${name:-$(basename "$proj")}"
+            echo "❌ Failed"
         fi
-    done <<< "$projects"
+        count=$((count + 1))
+    done <<< "$(managed_service_files)"
+    echo "--- Processed $count apps ---"
 }
 
 ps_dashboard() {
-    echo "-----------------------------------------------------------------------------------------"
-    printf "%-25s %-12s %-10s %-8s %-20s\n" "PROJECT ID" "STATUS" "PID" "PORT" "UPTIME"
-    echo "-----------------------------------------------------------------------------------------"
+    local line="--------------------------------------------------------------------------------------------"
+    echo "$line"
+    printf "%-25s %-12s %-8s %-6s %-12s %s\n" "APP NAME" "STATUS" "PID" "PORT" "UPTIME" "PROJECT"
+    echo "$line"
 
-    local projects proj name workdir req_port port_val raw_status display_status pid uptime
-    local running_dir real_running real_current
-    projects=$(list_projects) || exit 1
-
-    while IFS= read -r proj; do
-        [ -n "$proj" ] || continue
-        IFS='|' read -r name workdir req_port port_val <<< "$(project_summary "$proj")"
-
+    local file unit project port raw_status display_status pid uptime
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        unit=$(unit_from_file "$file")
+        project=$(unit_meta "$file" Project)
+        port=$(unit_meta "$file" Port)
         pid="-"
         uptime="-"
 
-        if ! valid_app_name "$name"; then
-            name="$(basename "$proj")"
-            display_status="BAD-CONFIG"
-        elif [ ! -f "$SYSTEMD_DIR/${name}.service" ]; then
-            display_status="UNREGISTERED"
-        else
-            # is-active prints the state and exits non-zero for anything but
-            # "active"; we only want the printed state.
-            raw_status=$(systemctl --user is-active "${name}.service" 2>/dev/null)
-            case "$raw_status" in
-                active)     display_status="RUNNING" ;;
-                inactive)   display_status="STOPPED" ;;
-                failed)     display_status="CRASHED" ;;
-                activating)
-                    if [ "$(systemctl --user show --property SubState --value "${name}.service")" == "auto-restart" ]; then
-                        display_status="RESTARTING"
-                    else
-                        display_status="STARTING"
-                    fi
-                    ;;
-                *)          display_status="${raw_status:-unknown}" ;;
-            esac
-        fi
+        # is-active prints the state and exits non-zero for anything but
+        # "active"; we only want the printed state.
+        raw_status=$(systemctl --user is-active "${unit}.service" 2>/dev/null)
+        case "$raw_status" in
+            active)     display_status="RUNNING" ;;
+            inactive)   display_status="STOPPED" ;;
+            failed)     display_status="CRASHED" ;;
+            activating)
+                if [ "$(systemctl --user show --property SubState --value "${unit}.service")" == "auto-restart" ]; then
+                    display_status="RESTARTING"
+                else
+                    display_status="STARTING"
+                fi
+                ;;
+            *)          display_status="${raw_status:-unknown}" ;;
+        esac
 
-        # Detect a service with this name that runs from another folder
         if [ "$display_status" == "RUNNING" ]; then
-            running_dir=$(systemctl --user show --property WorkingDirectory --value "${name}.service")
-            real_running=$(realpath "$running_dir" 2>/dev/null || echo "$running_dir")
-            real_current=$(realpath "$workdir" 2>/dev/null || echo "$workdir")
-
-            if [ "$real_running" != "$real_current" ]; then
-                display_status="CONFLICT"
-            else
-                pid=$(systemctl --user show --property MainPID --value "${name}.service")
-                uptime=$(ps -p "$pid" -o etime= 2>/dev/null | xargs)
-            fi
+            pid=$(systemctl --user show --property MainPID --value "${unit}.service")
+            uptime=$(ps -p "$pid" -o etime= 2>/dev/null | xargs)
         fi
 
-        if [ "$req_port" == "false" ]; then
-            port_val="N/A"
+        if [ -z "$project" ]; then
+            project="?"
+        elif [ ! -d "$project" ]; then
+            project="$project (missing)"
         fi
+        project="${project/#"$HOME"/\~}"
 
-        printf "%-25s %-12s %-10s %-8s %-20s\n" "$name" "$display_status" "$pid" "${port_val:--}" "${uptime:--}"
-    done <<< "$projects"
-    echo "-----------------------------------------------------------------------------------------"
+        printf "%-25s %-12s %-8s %-6s %-12s %s\n" "${unit#"$UNIT_PREFIX"}" "$display_status" "$pid" "${port:--}" "${uptime:--}" "$project"
+    done <<< "$(managed_service_files)"
+    echo "$line"
 }
 
 # --- DISPATCHER ---

@@ -1,5 +1,8 @@
 [Unit]
 Description=${DESCRIPTION}
+# Read by systemd-compose (ps, stop-all, name checks); ignored by systemd
+X-SDC-Project=${INSTALL_DIR}
+X-SDC-Port=${PORT}
 # Note: user services cannot wait for system targets such as network.target,
 # so apps should retry their network connections on startup.
 
