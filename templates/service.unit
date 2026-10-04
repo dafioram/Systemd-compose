@@ -5,8 +5,8 @@ Wants=time-sync.target
 
 [Service]
 Type=simple
-# Load secrets and config from .env
-EnvironmentFile=${INSTALL_DIR}/.env
+# Load secrets and config from .env (the leading "-" makes the file optional)
+EnvironmentFile=-${INSTALL_DIR}/.env
 Environment=PATH=${INSTALL_DIR}/venv/bin:/usr/local/bin:/usr/bin:/bin
 
 # Force Python to log errors immediately (don't wait for buffer)

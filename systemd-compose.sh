@@ -1,13 +1,17 @@
 #!/bin/bash
 
+set -uo pipefail
+
 # --- GLOBAL CONFIGURATION LOADING ---
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 TEMPLATE_FILE="$SCRIPT_DIR/templates/service.unit"
+SYSTEMD_DIR="$HOME/.config/systemd/user"
 
 if [ -f "$SCRIPT_DIR/.env" ]; then
-    set -a
+    set -a +u
+    # shellcheck source=/dev/null
     source "$SCRIPT_DIR/.env"
-    set +a
+    set +a -u
 fi
 
 APPS_ROOT="${APPS_ROOT:-$SCRIPT_DIR/projects}"
@@ -15,56 +19,125 @@ APPS_ROOT="${APPS_ROOT:-$SCRIPT_DIR/projects}"
 # Default to system python if not specified in project config.env
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
+# Keys a project .env may not set inside systemd-compose itself
+# (they would change how this script runs, not just the app).
+RESERVED_ENV_KEYS=" PATH HOME USER SHELL IFS PWD OLDPWD UID EUID PPID SHLVL SCRIPT_DIR TEMPLATE_FILE SYSTEMD_DIR APPS_ROOT PROJECT_DIR INSTALL_DIR SERVICE_FILE UNIT COMMAND "
+
+# --- HELPER FUNCTIONS ---
+
+usage() {
+    echo "Usage:"
+    echo "  Global:  systemd-compose [ps | stop-all | start-all]"
+    echo "  Project: systemd-compose <project_folder> [up|down|build|run|stop|restart|status|logs]"
+}
+
+die() {
+    echo "❌ Error: $*" >&2
+    exit 1
+}
+
+# Reads a KEY=VALUE file the same way systemd's EnvironmentFile= does:
+# nothing is executed, surrounding quotes are stripped, '#'/';' lines are comments.
+# Each key becomes a (non-exported) shell variable, so config.env can use e.g. $PORT.
+load_env_file() {
+    local file="$1" line key value lineno=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        lineno=$((lineno + 1))
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        if [ -z "$line" ] || [[ "$line" == \#* || "$line" == \;* ]]; then
+            continue
+        fi
+        if [[ "$line" == export[[:space:]]* ]]; then
+            echo "⚠️  $file:$lineno: systemd ignores 'export' lines. Use plain KEY=VALUE." >&2
+            continue
+        fi
+        if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            echo "⚠️  $file:$lineno: ignoring malformed line (expected KEY=VALUE)." >&2
+            continue
+        fi
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        value="${value%"${value##*[![:space:]]}"}"
+        if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then
+            value="${BASH_REMATCH[1]}"
+        fi
+        if [[ "$RESERVED_ENV_KEYS" == *" $key "* || "$key" == BASH* ]]; then
+            echo "⚠️  $file:$lineno: '$key' is reserved; systemd-compose will not read it." >&2
+            continue
+        fi
+        printf -v "$key" '%s' "$value"
+    done < "$file"
+}
+
+# Loads a project's .env and config.env into the current shell.
+# Call it in a subshell when looping over several projects.
+load_project_config() {
+    local dir="$1"
+    if [ -f "$dir/.env" ]; then
+        load_env_file "$dir/.env"
+    fi
+    INSTALL_DIR="$dir"
+    set +u
+    # shellcheck source=/dev/null
+    source "$dir/config.env"
+    set -u
+
+    APP_NAME="${APP_NAME:-}"
+    APP_NAME="${APP_NAME// /-}"
+    APP_DIR="${APP_DIR:-.}"
+    REQUIRE_PORT="${REQUIRE_PORT:-true}"
+    PORT="${PORT:-}"
+    ENTRYPOINT="${ENTRYPOINT:-}"
+    ARGS="${ARGS:-}"
+    DESCRIPTION="${DESCRIPTION:-$APP_NAME}"
+}
+
+valid_app_name() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
+}
+
+port_listening() {
+    ss -tuln 2>/dev/null | grep -qE ":$1[[:space:]]"
+}
+
 # --- ARGUMENT PARSING ---
 
 # List of global commands that DO NOT require a project directory
-if [[ "$1" == "ps" || "$1" == "stop-all" || "$1" == "start-all" ]]; then
-    COMMAND="$1"
-    PROJECT_DIR_ARG="" # Not needed
-elif [ -n "$1" ] && [ -n "$2" ]; then
-    PROJECT_DIR_ARG="$1"
-    COMMAND="$2"
-else
-    echo "Usage:"
-    echo "  Global:  app-ctl [ps | stop-all | start-all]"
-    echo "  Project: app-ctl <project_folder> [up|down|build|run|stop|restart|status|logs]"
-    exit 1
-fi
+case "${1:-}" in
+    ps|stop-all|start-all)
+        COMMAND="$1"
+        ;;
+    *)
+        if [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
+            usage
+            exit 1
+        fi
+        PROJECT_DIR_ARG="$1"
+        COMMAND="$2"
+        ;;
+esac
 
 # --- PROJECT CONTEXT LOADING ---
 
 if [[ "$COMMAND" != "ps" && "$COMMAND" != "stop-all" && "$COMMAND" != "start-all" ]]; then
     if [ ! -d "$PROJECT_DIR_ARG" ]; then
-        echo "❌ Error: Project directory '$PROJECT_DIR_ARG' not found."
-        exit 1
+        die "Project directory '$PROJECT_DIR_ARG' not found."
     fi
     PROJECT_DIR="$(realpath "$PROJECT_DIR_ARG")"
-    INSTALL_DIR="$PROJECT_DIR"
-    
-    # [FIX 1] Robust .env Loading
-    if [ -f "$PROJECT_DIR/.env" ]; then
-        set -a
-        source <(sed 's/\r$//' "$PROJECT_DIR/.env" | grep -v '^\s*#')
-        set +a
+    if [ ! -f "$PROJECT_DIR/config.env" ]; then
+        die "config.env not found in $PROJECT_DIR"
     fi
 
-    if [ -f "$PROJECT_DIR/config.env" ]; then
-        source "$PROJECT_DIR/config.env"
-    else
-        echo "❌ Error: config.env not found in $PROJECT_DIR"
-        exit 1
-    fi
-    
-    # Defaults
-    APP_NAME=$(echo "$APP_NAME" | tr ' ' '-')
-    if [ -z "$APP_DIR" ]; then APP_DIR="."; fi
-    if [ -z "$REQUIRE_PORT" ]; then REQUIRE_PORT="true"; fi
+    load_project_config "$PROJECT_DIR"
 
-    SYSTEMD_DIR="$HOME/.config/systemd/user"
-    SERVICE_FILE="$SYSTEMD_DIR/${APP_NAME}.service"
+    if ! valid_app_name "$APP_NAME"; then
+        die "APP_NAME '$APP_NAME' in $PROJECT_DIR/config.env is invalid. Use letters, digits, '-', '_' or '.' (spaces become '-')."
+    fi
+
+    UNIT="$APP_NAME"
+    SERVICE_FILE="$SYSTEMD_DIR/${UNIT}.service"
 fi
-
-# --- HELPER FUNCTIONS ---
 
 check_name_collision() {
     # If the service file doesn't exist, we are safe (new app)
@@ -73,11 +146,11 @@ check_name_collision() {
     fi
 
     # Extract the directory of the CURRENTLY registered service
-    EXISTING_PATH=$(grep '^WorkingDirectory=' "$SERVICE_FILE" | cut -d '=' -f 2)
-    
+    EXISTING_PATH=$(grep '^WorkingDirectory=' "$SERVICE_FILE" | cut -d '=' -f 2-)
+
     if [ -n "$EXISTING_PATH" ]; then
         EXISTING_REAL=$(realpath "$EXISTING_PATH" 2>/dev/null || echo "")
-        CURRENT_REAL=$(realpath "$INSTALL_DIR/$APP_DIR")
+        CURRENT_REAL=$(realpath "$INSTALL_DIR/$APP_DIR" 2>/dev/null || echo "$INSTALL_DIR/$APP_DIR")
 
         # THE CHECK: Paths are different AND the old path still exists
         if [ "$EXISTING_REAL" != "$CURRENT_REAL" ] && [ -d "$EXISTING_REAL" ]; then
@@ -85,17 +158,24 @@ check_name_collision() {
             echo "   The app name '$APP_NAME' is already claimed by another active project:"
             echo "   👉 $EXISTING_REAL"
             echo ""
-            echo "   To run this instance, you MUST change 'APP_NAME' in:"
+            echo "   To manage this project, you MUST change 'APP_NAME' in:"
             echo "   $PROJECT_DIR/config.env"
             echo "   (Example: APP_NAME=\"${APP_NAME}-2\")"
             return 1
         fi
-        
-        if [ ! -d "$EXISTING_REAL" ] && [ -n "$EXISTING_REAL" ]; then
+
+        if [ ! -d "$EXISTING_REAL" ] && [[ "$COMMAND" == "up" || "$COMMAND" == "run" || "$COMMAND" == "start" ]]; then
             echo "⚠️  Notice: Claiming orphaned service name '$APP_NAME' (Old path missing)."
         fi
     fi
     return 0
+}
+
+warn_config_exports() {
+    if grep -qE '^[[:space:]]*export[[:space:]]' "$PROJECT_DIR/config.env"; then
+        echo "⚠️  config.env contains 'export' lines. Those are NOT passed to your app;"
+        echo "   put variables your app needs in $PROJECT_DIR/.env instead."
+    fi
 }
 
 check_port() {
@@ -103,15 +183,22 @@ check_port() {
         return 0
     fi
 
-    if [ -z "$PORT" ]; then 
+    if [ -z "$PORT" ]; then
         echo "❌ Error: REQUIRE_PORT=true, but 'PORT' variable is missing in .env."
         return 1
     fi
 
-    if ss -tuln | grep -q ":$PORT "; then
+    if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+        echo "❌ Error: PORT='$PORT' is not a valid port number."
+        return 1
+    fi
+
+    if port_listening "$PORT"; then
         echo "❌ Error: Port $PORT is already in use."
         echo "   Process blocking this port:"
-        lsof -i :$PORT | grep LISTEN
+        if ! lsof -nP -i ":$PORT" -sTCP:LISTEN 2>/dev/null; then
+            echo "   (Owned by another user. Try: sudo lsof -i :$PORT)"
+        fi
         return 1
     fi
     echo "✅ Port $PORT is free."
@@ -119,40 +206,49 @@ check_port() {
 }
 
 check_binary() {
+    if [ -z "$ENTRYPOINT" ]; then
+        echo "❌ Error: ENTRYPOINT is not set in config.env (e.g. ENTRYPOINT=\"python\")."
+        return 1
+    fi
     BINARY_PATH="$INSTALL_DIR/venv/bin/$ENTRYPOINT"
     if [ ! -f "$BINARY_PATH" ]; then
-        echo "❌ Error: Binary '$ENTRYPOINT' not found in venv."
+        echo "❌ Error: Binary '$ENTRYPOINT' not found in venv. Run 'build' first, and check requirements.txt."
         return 1
     fi
     return 0
+}
+
+show_recent_logs() {
+    echo "--- 📜 Last ${1} Log Lines ---"
+    journalctl --user -u "${UNIT}.service" -n "$1" --no-pager
 }
 
 # --- CORE COMMANDS ---
 
 build() {
     echo "--- 🏗️ Building ${APP_NAME} ---"
-    
-    # [FIX] Check for name conflict BEFORE creating venv
-    if ! check_name_collision; then exit 1; fi
 
-    $PYTHON_BIN -c "import venv" 2>/dev/null
-    if [ $? -ne 0 ]; then
-        echo "❌ Error: 'venv' module missing. Run ./host-setup.sh"
-        exit 1
+    if ! "$PYTHON_BIN" -c "import venv" 2>/dev/null; then
+        die "'$PYTHON_BIN' is missing the 'venv' module. Run ./host-setup.sh"
     fi
 
     if [ ! -d "$INSTALL_DIR/venv" ]; then
         echo "Creating Python venv..."
-        $PYTHON_BIN -m venv "$INSTALL_DIR/venv"
+        if ! "$PYTHON_BIN" -m venv "$INSTALL_DIR/venv"; then
+            rm -rf "$INSTALL_DIR/venv"
+            die "Failed to create the venv."
+        fi
         if [ ! -f "$INSTALL_DIR/venv/bin/pip" ]; then
             echo "⚠️  Pip missing. Bootstrapping..."
-            "$INSTALL_DIR/venv/bin/python" -m ensurepip --upgrade
+            "$INSTALL_DIR/venv/bin/python" -m ensurepip --upgrade || die "Failed to bootstrap pip."
         fi
     fi
 
     echo "Installing dependencies..."
     if [ -f "$INSTALL_DIR/requirements.txt" ]; then
-        "$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" --quiet --disable-pip-version-check
+        if ! "$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" --quiet --disable-pip-version-check; then
+            die "Dependency installation failed (see pip output above)."
+        fi
     else
         echo "⚠️  No requirements.txt found."
     fi
@@ -161,33 +257,38 @@ build() {
 
 run() {
     echo "--- 🚀 Starting ${APP_NAME} ---"
-    
-    if ! check_name_collision; then exit 1; fi
-    if ! check_port; then exit 1; fi
+
+    warn_config_exports
     if ! check_binary; then exit 1; fi
+
+    # If this app is already installed, stop it first so a port it holds
+    # does not count as "in use" and the new config is applied cleanly.
+    if [ -f "$SERVICE_FILE" ]; then
+        systemctl --user stop "${UNIT}.service" 2>/dev/null
+    fi
+
+    if ! check_port; then exit 1; fi
 
     mkdir -p "$SYSTEMD_DIR"
 
-    cat "$TEMPLATE_FILE" | \
-    sed "s|\${DESCRIPTION}|$DESCRIPTION|g" | \
-    sed "s|\${INSTALL_DIR}|$INSTALL_DIR|g" | \
-    sed "s|\${ENTRYPOINT}|$ENTRYPOINT|g" | \
-    sed "s|\${APP_DIR}|$APP_DIR|g" | \
-    sed "s|\${ARGS}|$ARGS|g" \
-    > "$SERVICE_FILE"
+    sed \
+        -e "s|\${DESCRIPTION}|$DESCRIPTION|g" \
+        -e "s|\${INSTALL_DIR}|$INSTALL_DIR|g" \
+        -e "s|\${ENTRYPOINT}|$ENTRYPOINT|g" \
+        -e "s|\${APP_DIR}|$APP_DIR|g" \
+        -e "s|\${ARGS}|$ARGS|g" \
+        "$TEMPLATE_FILE" > "$SERVICE_FILE"
 
     systemctl --user daemon-reload
-    systemctl --user enable "${APP_NAME}"
-    
-    if ! systemctl --user restart "${APP_NAME}"; then
+    systemctl --user enable --quiet "${UNIT}.service"
+
+    if ! systemctl --user start "${UNIT}.service"; then
         echo ""
         echo "❌ Fatal: Systemd failed to start the service."
-        echo "   This usually means the app crashed immediately (e.g., port conflict)."
-        echo "--- 📜 Last 10 Log Lines ---"
-        journalctl --user -u "${APP_NAME}" -n 10 --no-pager
+        show_recent_logs 10
         exit 1
     fi
-    
+
     echo "Service started."
     sleep 1
     status
@@ -195,57 +296,45 @@ run() {
 
 stop() {
     echo "--- 🛑 Stopping ${APP_NAME} ---"
-    if systemctl --user is-active --quiet "${APP_NAME}"; then
-        systemctl --user stop "${APP_NAME}"
-        echo "Stopped."
-    else
-        echo "App was not running."
+    if [ ! -f "$SERVICE_FILE" ]; then
+        echo "Service is not installed."
+        return 0
     fi
+    # Always stop: an app in a crash loop is "activating", not "active".
+    if ! systemctl --user stop "${UNIT}.service"; then
+        die "Failed to stop ${UNIT}."
+    fi
+    echo "Stopped."
 }
 
 restart() {
     echo "--- ♻️  Restarting ${APP_NAME} ---"
-    if ! systemctl --user list-unit-files "${APP_NAME}.service" >/dev/null 2>&1; then
-        echo "❌ Service '${APP_NAME}' is not installed."
-        echo "   Run 'app-ctl <project> up' first to build and install it."
+    if [ ! -f "$SERVICE_FILE" ]; then
+        echo "❌ Service '${UNIT}' is not installed."
+        echo "   Run 'systemd-compose <project> up' first to build and install it."
         exit 1
     fi
 
-    systemctl --user restart "${APP_NAME}"
-    
-    if systemctl --user is-active --quiet "${APP_NAME}"; then
+    systemctl --user restart "${UNIT}.service"
+    sleep 1
+
+    if systemctl --user is-active --quiet "${UNIT}.service"; then
         echo "✅ Restarted successfully."
         status
     else
-        echo "❌ Restart Failed. Check logs:"
-        journalctl --user -u "${APP_NAME}" -n 10 --no-pager
+        echo "❌ Restart Failed."
+        show_recent_logs 10
+        exit 1
     fi
 }
 
 status() {
     echo "--- 📊 Status: ${APP_NAME} ---"
-    IS_ACTIVE=$(systemctl --user is-active "${APP_NAME}")
-    
-    # [FIX] Detect "Ghost" Services (Same Name, Different Folder)
-    if [ "$IS_ACTIVE" == "active" ]; then
-        RUNNING_DIR=$(systemctl --user show --property WorkingDirectory --value "${APP_NAME}")
-        REAL_RUNNING=$(realpath "$RUNNING_DIR" 2>/dev/null || echo "$RUNNING_DIR")
-        REAL_CURRENT=$(realpath "$INSTALL_DIR/$APP_DIR")
-
-        if [ "$REAL_RUNNING" != "$REAL_CURRENT" ]; then
-            echo "⚠️  WARNING: Service Identity Mismatch!"
-            echo "   Status is 'active', BUT it is running from a DIFFERENT folder:"
-            echo "   👉 $REAL_RUNNING"
-            echo "   (This folder: $REAL_CURRENT)"
-            echo "   You are seeing the status of the OTHER app."
-            echo ""
-            return
-        fi
-    fi
+    IS_ACTIVE=$(systemctl --user is-active "${UNIT}.service" 2>/dev/null)
 
     echo "Service State:  $IS_ACTIVE"
     if [ "$IS_ACTIVE" == "active" ]; then
-        MAIN_PID=$(systemctl --user show --property MainPID --value "${APP_NAME}")
+        MAIN_PID=$(systemctl --user show --property MainPID --value "${UNIT}.service")
         MEM_USAGE=$(ps -o rss= -p "$MAIN_PID" 2>/dev/null | awk '{print int($1/1024) " MB"}')
         echo "Main PID:       $MAIN_PID"
         echo "Memory Usage:   $MEM_USAGE"
@@ -253,15 +342,15 @@ status() {
 
     if [ "$REQUIRE_PORT" == "false" ]; then
         echo "Port:           N/A (Background Service)"
-    elif [ ! -z "$PORT" ]; then
-        if ss -tuln | grep -q ":$PORT "; then
+    elif [ -n "$PORT" ]; then
+        if port_listening "$PORT"; then
             echo "Port $PORT:      ✅ Listening"
         else
             echo "Port $PORT:      ❌ Not Listening"
         fi
     fi
     echo ""
-    journalctl --user -u "${APP_NAME}" -n 3 --no-pager
+    journalctl --user -u "${UNIT}.service" -n 3 --no-pager
 }
 
 up() {
@@ -273,9 +362,10 @@ up() {
 down() {
     echo "=== DOWN: ${APP_NAME} ==="
     stop
-    systemctl --user disable "${APP_NAME}" 2>/dev/null
+    systemctl --user disable --quiet "${UNIT}.service" 2>/dev/null
     rm -f "$SERVICE_FILE"
     systemctl --user daemon-reload
+    systemctl --user reset-failed "${UNIT}.service" 2>/dev/null
     if [ -d "$INSTALL_DIR/venv" ]; then
         echo "Removing venv..."
         rm -rf "$INSTALL_DIR/venv"
@@ -284,122 +374,146 @@ down() {
 }
 
 logs() {
-    journalctl --user -u "${APP_NAME}" -f
+    journalctl --user -u "${UNIT}.service" -f
 }
 
 # --- GLOBAL DASHBOARD COMMANDS ---
 
-stop_all() {
-    echo "--- 🛑 Stopping ALL Managed Services ---"
+# Prints "NAME|WORKING_DIR|REQUIRE_PORT|PORT" for a project folder,
+# loading its config in a subshell so nothing leaks between projects.
+project_summary() {
+    (
+        APP_NAME="" APP_DIR="" REQUIRE_PORT="" PORT=""
+        load_project_config "$1" >/dev/null 2>&1
+        echo "${APP_NAME}|$1/${APP_DIR}|${REQUIRE_PORT}|${PORT}"
+    )
+}
+
+# Prints each project folder under APPS_ROOT that has a config.env
+list_projects() {
     if [ ! -d "$APPS_ROOT" ]; then
-        echo "Error: APPS_ROOT directory '$APPS_ROOT' does not exist."
-        return
+        die "APPS_ROOT directory '$APPS_ROOT' does not exist."
     fi
-    
-    count=0
-    for proj in "$APPS_ROOT"/*; do
-        if [ -d "$proj" ] && [ -f "$proj/config.env" ]; then
-            (
-                source "$proj/config.env"
-                NAME=$(echo "$APP_NAME" | tr ' ' '-')
-                if systemctl --user is-active --quiet "$NAME"; then
-                    printf "Stopping %-25s ... " "$NAME"
-                    systemctl --user stop "$NAME"
-                    echo "✅ Done"
-                else
-                    printf "Skipping %-25s ... (Already Stopped)\n" "$NAME"
-                fi
-            )
-            count=$((count + 1))
+    local proj
+    for proj in "$APPS_ROOT"/*/; do
+        proj="${proj%/}"
+        if [ -f "$proj/config.env" ]; then
+            echo "$proj"
         fi
     done
+}
+
+stop_all() {
+    echo "--- 🛑 Stopping ALL Managed Services ---"
+    local projects proj name count=0
+    projects=$(list_projects) || exit 1
+
+    while IFS= read -r proj; do
+        [ -n "$proj" ] || continue
+        IFS='|' read -r name _ _ _ <<< "$(project_summary "$proj")"
+        if ! valid_app_name "$name"; then
+            printf "Skipping %-25s ... (Invalid APP_NAME)\n" "$(basename "$proj")"
+        elif [ -f "$SYSTEMD_DIR/${name}.service" ]; then
+            printf "Stopping %-25s ... " "$name"
+            if systemctl --user stop "${name}.service"; then
+                echo "✅ Done"
+            else
+                echo "❌ Failed"
+            fi
+        else
+            printf "Skipping %-25s ... (Not installed)\n" "$name"
+        fi
+        count=$((count + 1))
+    done <<< "$projects"
     echo "--- Processed $count apps ---"
 }
 
 start_all() {
     echo "--- 🚀 Starting ALL Managed Services ---"
-    if [ ! -d "$APPS_ROOT" ]; then
-        echo "Error: APPS_ROOT directory '$APPS_ROOT' does not exist."
-        return
-    fi
+    local projects proj name
+    projects=$(list_projects) || exit 1
 
-    for proj in "$APPS_ROOT"/*; do
-        if [ -d "$proj" ] && [ -f "$proj/config.env" ]; then
-            (
-                source "$proj/config.env"
-                NAME=$(echo "$APP_NAME" | tr ' ' '-')
-                if systemctl --user list-unit-files "${NAME}.service" >/dev/null 2>&1; then
-                    printf "Starting %-25s ... " "$NAME"
-                    systemctl --user start "$NAME"
-                    echo "✅ Triggered"
-                else
-                    printf "Skipping %-25s ... (Not installed)\n" "$NAME"
-                fi
-            )
+    while IFS= read -r proj; do
+        [ -n "$proj" ] || continue
+        IFS='|' read -r name _ _ _ <<< "$(project_summary "$proj")"
+        if valid_app_name "$name" && [ -f "$SYSTEMD_DIR/${name}.service" ]; then
+            printf "Starting %-25s ... " "$name"
+            if systemctl --user start "${name}.service"; then
+                echo "✅ Triggered"
+            else
+                echo "❌ Failed"
+            fi
+        else
+            printf "Skipping %-25s ... (Not installed)\n" "${name:-$(basename "$proj")}"
         fi
-    done
+    done <<< "$projects"
 }
 
 ps_dashboard() {
     echo "-----------------------------------------------------------------------------------------"
     printf "%-25s %-12s %-10s %-8s %-20s\n" "PROJECT ID" "STATUS" "PID" "PORT" "UPTIME"
     echo "-----------------------------------------------------------------------------------------"
-    
-    SEARCH_DIR="$APPS_ROOT"
-    if [ ! -d "$SEARCH_DIR" ]; then
-        echo "Error: APPS_ROOT directory '$SEARCH_DIR' does not exist."
-        return
-    fi
 
-    for proj in "$SEARCH_DIR"/*; do
-        if [ -d "$proj" ] && [ -f "$proj/config.env" ]; then
-            # Extract Vars from config.env
-            RAW_NAME=$(grep '^APP_NAME=' "$proj/config.env" | cut -d '"' -f 2)
-            REQ_PORT=$(grep '^REQUIRE_PORT=' "$proj/config.env" | cut -d '=' -f 2 | tr -d '"')
-            
-            NAME=$(echo "$RAW_NAME" | tr ' ' '-')
-            RAW_STATUS=$(systemctl --user is-active "$NAME" 2>/dev/null || echo "unknown")
-            
-            case "$RAW_STATUS" in
-                active)      DISPLAY_STATUS="RUNNING" ;;
-                inactive)    DISPLAY_STATUS="STOPPED" ;;
-                unknown)     DISPLAY_STATUS="UNREGISTERED" ;;
-                failed)      DISPLAY_STATUS="CRASHED" ;;
-                *)           DISPLAY_STATUS="$RAW_STATUS" ;;
+    local projects proj name workdir req_port port_val raw_status display_status pid uptime
+    local running_dir real_running real_current
+    projects=$(list_projects) || exit 1
+
+    while IFS= read -r proj; do
+        [ -n "$proj" ] || continue
+        IFS='|' read -r name workdir req_port port_val <<< "$(project_summary "$proj")"
+
+        pid="-"
+        uptime="-"
+
+        if ! valid_app_name "$name"; then
+            name="$(basename "$proj")"
+            display_status="BAD-CONFIG"
+        elif [ ! -f "$SYSTEMD_DIR/${name}.service" ]; then
+            display_status="UNREGISTERED"
+        else
+            # is-active prints the state and exits non-zero for anything but
+            # "active"; we only want the printed state.
+            raw_status=$(systemctl --user is-active "${name}.service" 2>/dev/null)
+            case "$raw_status" in
+                active)     display_status="RUNNING" ;;
+                inactive)   display_status="STOPPED" ;;
+                failed)     display_status="CRASHED" ;;
+                activating) display_status="STARTING" ;;
+                *)          display_status="${raw_status:-unknown}" ;;
             esac
-            
-            PID="-"
-            UPTIME="-"
-            PORT_VAL="-"
-
-            # [FIX] Check for Ghost Services in PS
-            if [ "$DISPLAY_STATUS" == "RUNNING" ]; then
-                RUNNING_DIR=$(systemctl --user show --property WorkingDirectory --value "$NAME")
-                REAL_RUNNING=$(realpath "$RUNNING_DIR" 2>/dev/null || echo "")
-                REAL_CURRENT=$(realpath "$proj")
-                
-                # If the running service does NOT match this folder
-                if [ "$REAL_RUNNING" != "$REAL_CURRENT" ]; then
-                    DISPLAY_STATUS="CONFLICT"
-                else
-                    PID=$(systemctl --user show --property MainPID --value "$NAME")
-                    UPTIME=$(ps -p "$PID" -o etime= 2>/dev/null | xargs)
-                fi
-            fi
-            
-            if [ "$REQ_PORT" == "false" ]; then
-                PORT_VAL="N/A"
-            elif [ -f "$proj/.env" ]; then
-                PORT_VAL=$(grep '^PORT=' "$proj/.env" | cut -d '=' -f 2)
-            fi
-            
-            printf "%-25s %-12s %-10s %-8s %-20s\n" "$NAME" "$DISPLAY_STATUS" "$PID" "$PORT_VAL" "$UPTIME"
         fi
-    done
+
+        # Detect a service with this name that runs from another folder
+        if [ "$display_status" == "RUNNING" ]; then
+            running_dir=$(systemctl --user show --property WorkingDirectory --value "${name}.service")
+            real_running=$(realpath "$running_dir" 2>/dev/null || echo "$running_dir")
+            real_current=$(realpath "$workdir" 2>/dev/null || echo "$workdir")
+
+            if [ "$real_running" != "$real_current" ]; then
+                display_status="CONFLICT"
+            else
+                pid=$(systemctl --user show --property MainPID --value "${name}.service")
+                uptime=$(ps -p "$pid" -o etime= 2>/dev/null | xargs)
+            fi
+        fi
+
+        if [ "$req_port" == "false" ]; then
+            port_val="N/A"
+        fi
+
+        printf "%-25s %-12s %-10s %-8s %-20s\n" "$name" "$display_status" "$pid" "${port_val:--}" "${uptime:--}"
+    done <<< "$projects"
     echo "-----------------------------------------------------------------------------------------"
 }
 
 # --- DISPATCHER ---
+
+# Every project command acts on the service named APP_NAME, so make sure
+# that name is not owned by a different project folder first.
+if [ -n "${SERVICE_FILE:-}" ]; then
+    if ! check_name_collision; then exit 1; fi
+fi
+
 case "$COMMAND" in
     up)        up ;;
     down)      down ;;
@@ -412,5 +526,9 @@ case "$COMMAND" in
     ps)        ps_dashboard ;;
     stop-all)  stop_all ;;
     start-all) start_all ;;
-    *)         echo "Unknown command: $COMMAND" ;;
+    *)
+        echo "Unknown command: $COMMAND"
+        usage
+        exit 1
+        ;;
 esac

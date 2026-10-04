@@ -26,7 +26,7 @@ Get the developer experience of Docker without the resource cost.
 * **Docker-like CLI:** Commands like `up`, `down`, `ps`, and `logs` make it easy to learn.
 * **Isolated Environments:** Automatically creates and manages Python `venvs` for each project.
 * **Conflict Detection:** Prevents multiple projects from trying to claim the same service name.
-* **Zero-Downtime Config:** Change secrets in `.env`, run `run`, and restart instantly.
+* **Quick Config Changes:** Edit `.env`, then `run` regenerates the service and restarts the app.
 * **Flexible:** Supports Python scripts, Uvicorn (FastAPI), Gunicorn, or even static React sites (via wrapper).
 * **Global Dashboard:** View the status of all your apps with a single `ps` command.
 
@@ -80,9 +80,10 @@ cd ~/my-new-bot
 | Command | Description |
 | --- | --- |
 | `systemd-compose . build` | Creates the `venv` and installs `requirements.txt`. |
-| `systemd-compose . run` | Generates the Systemd service and starts the app. |
+| `systemd-compose . run` | Generates the Systemd service and (re)starts the app. Safe to re-run while it is running. |
 | `systemd-compose . up` | **Recommended.** Runs `build` + `run` (like `docker-compose up`). |
-| `systemd-compose . stop` | Stops the process (preserves venv and logs). |
+| `systemd-compose . stop` | Stops the process (preserves venv and logs). It still starts again on boot. |
+| `systemd-compose . restart` | Restarts with the existing service file. Re-reads `.env`, but use `run` if you changed `config.env` or `PORT`. |
 | `systemd-compose . down` | Stops the process, removes the service, and **deletes the venv**. |
 | `systemd-compose . logs` | Tails the real-time logs of the application. |
 | `systemd-compose . status` | Shows detailed status (PID, Memory, Port connectivity). |
@@ -121,18 +122,31 @@ ENTRYPOINT="python"
 ARGS="${INSTALL_DIR}/${APP_DIR}/bot.py"
 
 # NETWORK CONFIGURATION
+# "true": PORT must be set in .env and be free before the app starts.
 # Set to "false" for background scripts/bots that don't listen on a port.
 REQUIRE_PORT="true"
 ```
 
+`config.env` is only read by systemd-compose. `export` lines in it do **not** reach your app; put those variables in `.env`.
+
+`APP_NAME` becomes the systemd service name: use letters, digits, `-`, `_` or `.` (spaces are turned into `-`).
+
 ### 2. `.env` (Secrets & Local Config, Project Specific)
 
-This file defines *how* to run (Ports, Keys). **Add this to `.gitignore**`.
+This file defines *how* to run (Ports, Keys). **Add this to `.gitignore`**.
 
 ```bash
 PORT=8000
 SECRET_KEY=super_secret_value
 ```
+
+This is the **only** place to put environment variables your app should see; systemd hands it to the app with `EnvironmentFile=`. Use systemd's format:
+
+* One plain `KEY=VALUE` per line. Quotes around the value are optional and are stripped.
+* No `export`, no `$VARIABLE` expansion, no `$(commands)`, and no comments after a value. Full-line `#` comments are fine.
+* systemd-compose also reads this file (it never executes it), so `config.env` can use `$PORT` and other values from it.
+
+`.env` is optional when `REQUIRE_PORT="false"`.
 
 ---
 
