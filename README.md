@@ -52,6 +52,8 @@ This script checks for OS compatibility (Debian/Ubuntu), installs necessary syst
 
 **Note:** You will need `sudo` access only once during this step to install the Debian packages.
 
+**Requires systemd 240 or newer** (Debian 10+, Ubuntu 20.04+, Raspberry Pi OS Buster+).
+
 ### 3. Verify
 
 You can now run `systemd-compose` from anywhere.
@@ -86,7 +88,7 @@ cd ~/my-new-bot
 | `systemd-compose . restart` | Restarts with the existing service file. Re-reads `.env`, but use `run` if you changed `config.env` or `PORT`. |
 | `systemd-compose . down` | Stops the process, removes the service, and **deletes the venv**. |
 | `systemd-compose . logs` | Tails the real-time logs of the application. |
-| `systemd-compose . status` | Shows detailed status (PID, Memory, Port connectivity). |
+| `systemd-compose . status` | Shows detailed status (PID, memory of all workers, restarts, port). |
 
 ### Global Dashboard
 
@@ -163,6 +165,27 @@ ARGS="main:app --app-dir ${INSTALL_DIR}/${APP_DIR} --host 0.0.0.0 --port $PORT"
 ```
 
 *Remember to add `uvicorn` to your `requirements.txt`!*
+
+### How `ARGS` is used
+
+`ARGS` is expanded by the shell when systemd-compose reads `config.env` (so `${INSTALL_DIR}`, `${APP_DIR}` and `$PORT` are filled in), then written into the service's `ExecStart=` line. There, systemd splits it into arguments:
+
+* Wrap an argument containing spaces in quotes, e.g. `ARGS="--name 'My App'"`.
+* `%` and `$` are passed through literally (systemd-compose escapes them), so a log format like `'%(h)s %(r)s'` is safe.
+* Because values are filled in when the service is written, run `systemd-compose . run` (not `restart`) after changing `config.env` or `PORT`.
+
+### Startup Check & Crash Handling
+
+After starting the app, `run`/`up`/`restart` watch it before reporting success:
+
+* **Apps with a port:** succeed as soon as `PORT` is listening. They fail if the app crashes, or if it isn't listening after `STARTUP_TIMEOUT` seconds (default `15`). Set `STARTUP_TIMEOUT="60"` in `config.env` for slow-starting apps.
+* **Background apps** (`REQUIRE_PORT="false"`): succeed if the app is still running, without restarts, after 3 seconds.
+
+On failure the last log lines are printed and the command exits with an error.
+
+While running, systemd restarts the app 5 seconds after a crash (`Restart=on-failure`). If it crashes 5 times within 2 minutes, systemd gives up and `ps` shows it as **CRASHED**. Fix the problem, then `run` again. An app that exits cleanly (exit code 0) is not restarted.
+
+User services can't wait for the system's network to come up at boot, so apps that connect to other hosts should retry on startup.
 
 ### Customizing the Project Root
 

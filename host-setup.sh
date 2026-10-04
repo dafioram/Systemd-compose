@@ -63,6 +63,13 @@ if ! python3 -c "import venv" 2>/dev/null; then
     # Don't exit, let the user decide if they want to continue
 fi
 
+# --- CHECK: SYSTEMD VERSION ---
+# Generated services use Type=exec, which needs systemd 240+ (Debian 10+, Ubuntu 20.04+).
+SYSTEMD_VERSION=$(systemctl --version 2>/dev/null | awk 'NR==1 {print $2}')
+if [[ "$SYSTEMD_VERSION" =~ ^[0-9]+$ ]] && [ "$SYSTEMD_VERSION" -lt 240 ]; then
+    echo "❌ Error: systemd $SYSTEMD_VERSION is too old. systemd-compose needs systemd 240 or newer."
+fi
+
 # --- HELPER: FIX DIETPI / MINIMAL LOGIND ---
 
 ensure_logind_service() {
