@@ -21,10 +21,29 @@ RESERVED_ENV_KEYS=" PATH HOME USER SHELL IFS PWD OLDPWD UID EUID PPID SHLVL SCRI
 
 # --- HELPER FUNCTIONS ---
 
+PROJECT_COMMANDS=" up down build run start stop restart status logs exec config "
+GLOBAL_COMMANDS=" ps stop-all start-all "
+
 usage() {
     echo "Usage:"
-    echo "  Global:  systemd-compose [ps | stop-all | start-all]"
-    echo "  Project: systemd-compose <project_folder> [up|down|build|run|stop|restart|status|logs]"
+    echo "  systemd-compose [project_folder] <command> [options]"
+    echo ""
+    echo "Project commands (project_folder defaults to the current folder):"
+    echo "  up                 Build the venv, then install and start the app"
+    echo "  build              Create the venv and install requirements.txt"
+    echo "  run                Write the service file and (re)start the app"
+    echo "  restart            Restart the app with the existing service file"
+    echo "  stop               Stop the app"
+    echo "  down [--volumes]   Stop and remove the service (--volumes also deletes the venv)"
+    echo "  status             Show state, PID, memory, restarts and port"
+    echo "  logs [options]     Follow the logs, or pass journalctl options (e.g. -n 100)"
+    echo "  exec <cmd> [args]  Run a command with the app's venv and .env (e.g. exec python manage.py migrate)"
+    echo "  config             Print the service file that 'run' would write"
+    echo ""
+    echo "Global commands:"
+    echo "  ps                 List all installed apps"
+    echo "  stop-all           Stop all installed apps"
+    echo "  start-all          Start all installed apps"
 }
 
 die() {
@@ -32,10 +51,10 @@ die() {
     exit 1
 }
 
-# Reads a KEY=VALUE file the same way systemd's EnvironmentFile= does:
-# nothing is executed, surrounding quotes are stripped, '#'/';' lines are comments.
-# Each key becomes a (non-exported) shell variable, so config.env can use e.g. $PORT.
-load_env_file() {
+# Reads a KEY=VALUE file the same way systemd's EnvironmentFile= does and
+# prints one KEY=VALUE per line: nothing is executed, surrounding quotes are
+# stripped, '#'/';' lines are comments. Problems are reported on stderr.
+parse_env_file() {
     local file="$1" line key value lineno=0
     while IFS= read -r line || [ -n "$line" ]; do
         lineno=$((lineno + 1))
@@ -58,12 +77,22 @@ load_env_file() {
         if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then
             value="${BASH_REMATCH[1]}"
         fi
+        printf '%s=%s\n' "$key" "$value"
+    done < "$file"
+}
+
+# Turns each key in a .env file into a (non-exported) shell variable, so
+# config.env can use e.g. $PORT.
+load_env_file() {
+    local pair key
+    while IFS= read -r pair; do
+        key="${pair%%=*}"
         if [[ "$RESERVED_ENV_KEYS" == *" $key "* || "$key" == BASH* ]]; then
-            echo "⚠️  $file:$lineno: '$key' is reserved; systemd-compose will not read it." >&2
+            echo "⚠️  $1: '$key' is reserved; systemd-compose will not read it." >&2
             continue
         fi
-        printf -v "$key" '%s' "$value"
-    done < "$file"
+        printf -v "$key" '%s' "${pair#*=}"
+    done < <(parse_env_file "$1")
 }
 
 # Loads a project's .env and config.env into the current shell.
@@ -88,6 +117,8 @@ load_project_config() {
     ARGS="${ARGS:-}"
     DESCRIPTION="${DESCRIPTION:-$APP_NAME}"
     STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-15}"
+    MEMORY_MAX="${MEMORY_MAX:-}"
+    CPU_QUOTA="${CPU_QUOTA:-}"
     if ! [[ "$STARTUP_TIMEOUT" =~ ^[0-9]+$ ]]; then
         STARTUP_TIMEOUT=15
     fi
@@ -111,24 +142,56 @@ port_listening() {
 
 # --- ARGUMENT PARSING ---
 
-# List of global commands that DO NOT require a project directory
+# Accepts "systemd-compose <command>" (current folder) as well as
+# "systemd-compose <project_folder> <command>". Anything after the command
+# is kept in EXTRA_ARGS for commands that take options (logs, down).
+PROJECT_DIR_ARG=""
 case "${1:-}" in
-    ps|stop-all|start-all)
-        COMMAND="$1"
+    "")
+        usage
+        exit 1
+        ;;
+    -h|--help|help)
+        usage
+        exit 0
         ;;
     *)
-        if [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
+        if [[ "$GLOBAL_COMMANDS" == *" $1 "* ]]; then
+            COMMAND="$1"
+            shift
+        elif [[ "$PROJECT_COMMANDS" == *" $1 "* ]]; then
+            PROJECT_DIR_ARG="."
+            COMMAND="$1"
+            shift
+        elif [ -n "${2:-}" ]; then
+            PROJECT_DIR_ARG="$1"
+            COMMAND="$2"
+            shift 2
+        elif [ -d "$1" ]; then
+            usage
+            exit 1
+        else
+            echo "Unknown command: $1"
             usage
             exit 1
         fi
-        PROJECT_DIR_ARG="$1"
-        COMMAND="$2"
+        ;;
+esac
+EXTRA_ARGS=("$@")
+
+# Only these commands take options; catch typos like "stop --all"
+case "$COMMAND" in
+    logs|down|exec) ;;
+    *)
+        if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
+            die "'$COMMAND' does not take extra arguments: ${EXTRA_ARGS[*]}"
+        fi
         ;;
 esac
 
 # --- PROJECT CONTEXT LOADING ---
 
-if [[ "$COMMAND" != "ps" && "$COMMAND" != "stop-all" && "$COMMAND" != "start-all" ]]; then
+if [ -n "$PROJECT_DIR_ARG" ]; then
     if [ ! -d "$PROJECT_DIR_ARG" ]; then
         die "Project directory '$PROJECT_DIR_ARG' not found."
     fi
@@ -242,12 +305,22 @@ render_unit() {
     if [[ "$INSTALL_DIR" == *[\"\\]* ]]; then
         die "The project path can't contain '\"' or '\\': $INSTALL_DIR"
     fi
+    if [ -n "$MEMORY_MAX" ] && ! [[ "$MEMORY_MAX" =~ ^[0-9]+[KMGT]?$|^[0-9]+%$|^infinity$ ]]; then
+        die "MEMORY_MAX='$MEMORY_MAX' is invalid. Use a size like 300M or 1G, a percentage like 25%, or leave it empty."
+    fi
+    if [ -n "$CPU_QUOTA" ] && ! [[ "$CPU_QUOTA" =~ ^[0-9]+%$ ]]; then
+        die "CPU_QUOTA='$CPU_QUOTA' is invalid. Use a percentage of one core, like 50% (or 200% for two cores)."
+    fi
 
     while IFS= read -r line || [ -n "$line" ]; do
         key="${line%%=*}"
-        for var in DESCRIPTION INSTALL_DIR ENTRYPOINT APP_DIR ARGS PORT; do
+        for var in DESCRIPTION INSTALL_DIR ENTRYPOINT APP_DIR ARGS PORT MEMORY_MAX CPU_QUOTA; do
             value="${!var}"
-            value="${value//%/%%}"
+            # MemoryMax=/CPUQuota= take "%" literally (no specifiers); their
+            # values are validated above, so they are written as-is.
+            if [[ "$var" != "MEMORY_MAX" && "$var" != "CPU_QUOTA" ]]; then
+                value="${value//%/%%}"
+            fi
             if [ "$key" == "ExecStart" ]; then
                 value="${value//\$/\$\$}"
             fi
@@ -286,6 +359,22 @@ wait_for_startup() {
             return 1
         fi
     done
+}
+
+# Limits only work when the kernel lets the user manager control memory/CPU
+# (cgroup v2 with the controllers delegated). Warn instead of failing silently.
+warn_unenforced_limits() {
+    local uid controllers_file controllers
+    uid=$(id -u)
+    controllers_file="/sys/fs/cgroup/user.slice/user-${uid}.slice/user@${uid}.service/cgroup.controllers"
+    [ -r "$controllers_file" ] || return 0
+    controllers=" $(cat "$controllers_file") "
+    if [ -n "$MEMORY_MAX" ] && [[ "$controllers" != *" memory "* ]]; then
+        echo "⚠️  MEMORY_MAX is set, but the memory controller isn't available to user services, so it won't be enforced."
+    fi
+    if [ -n "$CPU_QUOTA" ] && [[ "$controllers" != *" cpu "* ]]; then
+        echo "⚠️  CPU_QUOTA is set, but the cpu controller isn't available to user services, so it won't be enforced."
+    fi
 }
 
 # Memory of the whole service (all workers), not just the main process.
@@ -349,6 +438,7 @@ run() {
     echo "--- 🚀 Starting ${APP_NAME} ---"
 
     warn_config_exports
+    warn_unenforced_limits
     if ! check_binary; then exit 1; fi
 
     # If this app is already installed, stop it first so a port it holds
@@ -427,7 +517,7 @@ status() {
     if [ "$IS_ACTIVE" == "active" ]; then
         MAIN_PID=$(systemctl --user show --property MainPID --value "${UNIT}.service")
         echo "Main PID:       $MAIN_PID"
-        echo "Memory Usage:   $(service_memory)"
+        echo "Memory Usage:   $(service_memory)${MEMORY_MAX:+ (limit $MEMORY_MAX)}"
         echo "Restarts:       $(systemctl --user show --property NRestarts --value "${UNIT}.service")"
     fi
 
@@ -451,21 +541,79 @@ up() {
 }
 
 down() {
+    local remove_venv=0 arg
+    for arg in "${EXTRA_ARGS[@]}"; do
+        case "$arg" in
+            -v|--volumes) remove_venv=1 ;;
+            *) die "Unknown option for down: $arg (did you mean --volumes?)" ;;
+        esac
+    done
+
     echo "=== DOWN: ${APP_NAME} ==="
     stop
     systemctl --user disable --quiet "${UNIT}.service" 2>/dev/null
     rm -f "$SERVICE_FILE"
     systemctl --user daemon-reload
     systemctl --user reset-failed "${UNIT}.service" 2>/dev/null
-    if [ -d "$INSTALL_DIR/venv" ]; then
+    if [ "$remove_venv" == "1" ] && [ -d "$INSTALL_DIR/venv" ]; then
         echo "Removing venv..."
         rm -rf "$INSTALL_DIR/venv"
     fi
     echo "Cleanup complete."
 }
 
+# With no options, follow the logs. Otherwise pass the options to journalctl,
+# e.g. "logs -n 100" or "logs --since today -f".
 logs() {
-    journalctl --user -u "${UNIT}.service" -f
+    if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
+        EXTRA_ARGS=(-f)
+    fi
+    journalctl --user -u "${UNIT}.service" "${EXTRA_ARGS[@]}"
+}
+
+# Runs a one-off command the way the service runs the app: venv first on
+# PATH, the variables from .env, in the app's working directory.
+exec_command() {
+    if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then
+        die "Usage: systemd-compose [project_folder] exec <command> [args...]"
+    fi
+    if [ ! -d "$INSTALL_DIR/venv" ]; then
+        die "No venv in $INSTALL_DIR. Run 'build' first."
+    fi
+
+    local env_vars=() pair
+    if [ -f "$INSTALL_DIR/.env" ]; then
+        while IFS= read -r pair; do
+            env_vars+=("$pair")
+        done < <(parse_env_file "$INSTALL_DIR/.env" 2>/dev/null)
+    fi
+
+    cd "$INSTALL_DIR/$APP_DIR" || die "Can't enter $INSTALL_DIR/$APP_DIR"
+    # Same order as the service: .env comes last, so it wins (as in systemd)
+    exec env -- \
+        "PATH=$INSTALL_DIR/venv/bin:$PATH" \
+        "VIRTUAL_ENV=$INSTALL_DIR/venv" \
+        PYTHONUNBUFFERED=1 \
+        PYTHONDONTWRITEBYTECODE=1 \
+        "${env_vars[@]}" \
+        "${EXTRA_ARGS[@]}"
+}
+
+# Prints the service file "run" would write, and whether it differs from
+# the installed one. Nothing is changed.
+show_config() {
+    local unit_content
+    unit_content=$(render_unit) || exit 1
+    echo "# $SERVICE_FILE"
+    printf '%s\n' "$unit_content"
+    echo ""
+    if [ ! -f "$SERVICE_FILE" ]; then
+        echo "# Not installed yet. Run 'up' or 'run' to install it."
+    elif [ "$(cat "$SERVICE_FILE")" == "$unit_content" ]; then
+        echo "# The installed service file is up to date."
+    else
+        echo "# The installed service file is different. Run 'run' to apply these changes."
+    fi
 }
 
 # --- GLOBAL DASHBOARD COMMANDS ---
@@ -572,9 +720,10 @@ ps_dashboard() {
 
 # --- DISPATCHER ---
 
-# Every project command acts on the service named APP_NAME, so make sure
-# that name is not owned by a different project folder first.
-if [ -n "${SERVICE_FILE:-}" ]; then
+# Every command that manages the service acts on the service named APP_NAME,
+# so make sure that name is not owned by a different project folder first.
+# exec and config don't touch the service.
+if [ -n "${SERVICE_FILE:-}" ] && [[ "$COMMAND" != "exec" && "$COMMAND" != "config" ]]; then
     if ! check_name_collision; then exit 1; fi
 fi
 
@@ -587,6 +736,8 @@ case "$COMMAND" in
     restart)   restart ;;
     status)    status ;;
     logs)      logs ;;
+    exec)      exec_command ;;
+    config)    show_config ;;
     ps)        ps_dashboard ;;
     stop-all)  stop_all ;;
     start-all) start_all ;;
