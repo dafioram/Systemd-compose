@@ -1,13 +1,5 @@
 #!/bin/bash
 
-# --- OS COMPATIBILITY CHECK ---
-if ! command -v apt-get &> /dev/null; then
-    echo "❌ Error: This script supports Debian/Ubuntu based systems only."
-    echo "   (Raspbian, DietPi, Ubuntu, Mint, etc.)"
-    echo "   Reason: It relies on 'apt' for package management."
-    exit 1
-fi
-
 # Dependencies:
 # python3-venv:      Critical for creating isolated environments
 # python3-pip:       Required for package management
@@ -20,6 +12,91 @@ DEPS=("python3" "python3-venv" "python3-pip" "git" "lsof" "iproute2" "dbus-user-
 TARGET_LINK="/usr/local/bin/systemd-compose"
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 SOURCE_SCRIPT="$SCRIPT_DIR/systemd-compose.sh"
+
+JOURNAL_DIR="${JOURNAL_DIR:-/var/log/journal}"
+JOURNALD_DROPIN_DIR="${JOURNALD_DROPIN_DIR:-/etc/systemd/journald.conf.d}"
+JOURNALD_DROPIN="$JOURNALD_DROPIN_DIR/99-systemd-compose.conf"
+
+# --- HELPERS: LOG ACCESS ---
+
+# Prints journald's effective Storage= setting: auto, persistent, volatile or none
+journal_storage_setting() {
+    local storage
+    storage=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null \
+        | sed -n 's/^[[:space:]]*Storage=[[:space:]]*//p' | tail -n 1)
+    echo "${storage:-auto}"
+}
+
+# journald only writes a separate journal per user (which that user may read
+# without extra groups) when logs are stored on disk.
+journal_is_persistent() {
+    case "$(journal_storage_setting)" in
+        persistent) return 0 ;;
+        auto) [ -d "$JOURNAL_DIR" ] ;;
+        *) return 1 ;;
+    esac
+}
+
+enable_persistent_journal() {
+    sudo mkdir -p "$JOURNALD_DROPIN_DIR" &&
+        printf '# Added by systemd-compose host-setup.sh\n[Journal]\nStorage=persistent\n' \
+            | sudo tee "$JOURNALD_DROPIN" >/dev/null &&
+        sudo systemctl restart systemd-journald &&
+        sudo journalctl --flush
+}
+
+# Makes sure `systemd-compose logs` can show the user's app logs. Prefers
+# storing the journal on disk (each user reads only their own logs) over the
+# systemd-journal group (which can read every log on the system).
+ensure_log_access() {
+    if id -nG "$USER" | grep -qw "systemd-journal"; then
+        echo "✅ User is in the 'systemd-journal' group (logs visible)."
+        return 0
+    fi
+    if journal_is_persistent; then
+        echo "✅ The journal is stored on disk, so you can read your apps' logs."
+        return 0
+    fi
+
+    echo "⚠️  The system journal is only kept in memory (Storage=$(journal_storage_setting))."
+    echo "   In that mode you can't read your own apps' logs without extra permissions."
+    echo "   Recommended: store the journal on disk. Each user can then read their own logs."
+    echo "   (journald limits it to 10% of the disk, 4 GB at most.)"
+    read -p "❓ Store the journal on disk? (Requires sudo) [y/N] " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        if enable_persistent_journal && journal_is_persistent; then
+            echo "✅ The journal is now stored on disk ($JOURNALD_DROPIN)."
+            return 0
+        fi
+        echo "❌ Couldn't switch the journal to disk. Another setting may override it:"
+        echo "   systemd-analyze cat-config systemd/journald.conf"
+    fi
+
+    echo "   Alternative: join the 'systemd-journal' group. Note: it can read ALL system logs."
+    read -p "❓ Add user '$USER' to the group? (Requires sudo) [y/N] " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        sudo usermod -aG systemd-journal "$USER"
+        echo "✅ User added to group."
+        GROUPS_CHANGED=1
+    else
+        echo "⚠️  Skipped. 'systemd-compose logs' may show nothing."
+    fi
+}
+
+# The tests source this file to check the helpers above; stop here for them.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
+
+# --- OS COMPATIBILITY CHECK ---
+if ! command -v apt-get &> /dev/null; then
+    echo "❌ Error: This script supports Debian/Ubuntu based systems only."
+    echo "   (Raspbian, DietPi, Ubuntu, Mint, etc.)"
+    echo "   Reason: It relies on 'apt' for package management."
+    exit 1
+fi
 
 echo "=== 🛠️  Host Dependency Check ==="
 
@@ -129,21 +206,9 @@ fix_shell_environment() {
 ensure_logind_service
 fix_shell_environment
 
-# --- ACTION: LOG PERMISSIONS ---
+# --- ACTION: LOG ACCESS ---
 
-if groups "$USER" | grep -q "systemd-journal"; then
-    echo "✅ User is in 'systemd-journal' group (Logs visible)."
-else
-    echo "⚠️  User '$USER' is NOT in 'systemd-journal' group."
-    echo "   You won't be able to see app logs without this."
-    read -p "❓ Add user to group now? (Requires sudo) [y/N] " -n 1 -r
-    echo ""
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        sudo usermod -aG systemd-journal "$USER"
-        echo "✅ User added to group."
-        GROUPS_CHANGED=1
-    fi
-fi
+ensure_log_access
 
 # --- ACTION: ENABLE LINGER ---
 
