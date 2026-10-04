@@ -1,0 +1,101 @@
+#!/bin/bash
+# Fake `systemctl --user` for tests. It keeps unit states in files under
+# $STUB_STATE and never touches the real systemd.
+#
+# Knobs (environment variables):
+#   STUB_START_FAIL=1             start/restart fails, unit ends up "failed"
+#   STUB_STATE_AFTER_START=state  state after a start (default "active")
+#   STUB_LISTEN=port              the started app "listens" on this port (see stubs/ss)
+#   STUB_NRESTARTS=n              value of the NRestarts property
+#   STUB_MEM=bytes                value of the MemoryCurrent property
+#   STUB_SUBSTATE=state           value of the SubState property
+
+STATE_DIR="${STUB_STATE:?STUB_STATE must be set}"
+mkdir -p "$STATE_DIR/units"
+echo "systemctl $*" >> "$STATE_DIR/calls"
+
+args=()
+quiet=0
+for arg in "$@"; do
+    case "$arg" in
+        --quiet) quiet=1 ;;
+        --user|--no-pager) ;;
+        *) args+=("$arg") ;;
+    esac
+done
+
+cmd="${args[0]:-}"
+unit="${args[${#args[@]}-1]}"
+unit="${unit%.service}"
+unit_file="$HOME/.config/systemd/user/$unit.service"
+
+state() { cat "$STATE_DIR/units/$unit" 2>/dev/null || echo inactive; }
+set_state() { echo "$1" > "$STATE_DIR/units/$unit"; }
+release_ports() {
+    if [ -f "$STATE_DIR/ports" ]; then
+        sed -i "/ $unit\$/d" "$STATE_DIR/ports"
+    fi
+}
+
+case "$cmd" in
+    daemon-reload|enable|disable)
+        exit 0
+        ;;
+    reset-failed)
+        if [ "$(state)" == "failed" ]; then set_state inactive; fi
+        exit 0
+        ;;
+    start|restart)
+        if [ ! -f "$unit_file" ]; then
+            echo "Failed to start $unit.service: Unit $unit.service not found." >&2
+            exit 5
+        fi
+        release_ports
+        if [ "${STUB_START_FAIL:-0}" == "1" ]; then
+            set_state failed
+            echo "Job for $unit.service failed." >&2
+            exit 1
+        fi
+        set_state "${STUB_STATE_AFTER_START:-active}"
+        if [ -n "${STUB_LISTEN:-}" ] && [ "$(state)" == "active" ]; then
+            echo "$STUB_LISTEN $unit" >> "$STATE_DIR/ports"
+        fi
+        exit 0
+        ;;
+    stop)
+        if [ ! -f "$unit_file" ] && [ ! -f "$STATE_DIR/units/$unit" ]; then
+            echo "Failed to stop $unit.service: Unit $unit.service not loaded." >&2
+            exit 5
+        fi
+        set_state inactive
+        release_ports
+        exit 0
+        ;;
+    is-active)
+        current="$(state)"
+        if [ "$quiet" == "0" ]; then echo "$current"; fi
+        [ "$current" == "active" ]
+        ;;
+    show)
+        prop=""
+        for ((i = 0; i < ${#args[@]}; i++)); do
+            case "${args[i]}" in
+                --property|-p) prop="${args[i+1]}" ;;
+                --property=*) prop="${args[i]#*=}" ;;
+            esac
+        done
+        case "$prop" in
+            WorkingDirectory) grep '^WorkingDirectory=' "$unit_file" 2>/dev/null | cut -d= -f2- ;;
+            MainPID) if [ "$(state)" == "active" ]; then echo "$$"; else echo 0; fi ;;
+            ActiveState) state ;;
+            SubState) echo "${STUB_SUBSTATE:-running}" ;;
+            NRestarts) echo "${STUB_NRESTARTS:-0}" ;;
+            MemoryCurrent) echo "${STUB_MEM:-[not set]}" ;;
+            *) echo "" ;;
+        esac
+        ;;
+    *)
+        echo "stub systemctl: unsupported command: $*" >&2
+        exit 1
+        ;;
+esac

@@ -288,6 +288,20 @@ systemctl --user daemon-reload
 
 ---
 
+## 🧪 Development
+
+The tests use [bats](https://github.com/bats-core/bats-core) with fake `systemctl`, `ss` and `journalctl` commands (`tests/stubs/`), so they never touch your real services.
+
+```bash
+sudo apt install bats shellcheck
+bats tests
+shellcheck systemd-compose.sh host-setup.sh tests/stubs/* tests/test_helper.bash tests/*.bats
+```
+
+CI runs both on every pull request.
+
+---
+
 ## 🗑 Uninstall
 
 ```bash
