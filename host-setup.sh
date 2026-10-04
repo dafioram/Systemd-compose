@@ -13,9 +13,10 @@ fi
 # python3-pip:       Required for package management
 # git:               Version control
 # lsof:              Used to check for blocking ports
+# iproute2:          Provides "ss", used to check which ports are listening
 # dbus-user-session: REQUIRED for 'systemctl --user' on minimal distros (DietPi)
 # libpam-systemd:    Triggers systemd startup on login
-DEPS=("python3" "python3-venv" "python3-pip" "git" "lsof" "dbus-user-session" "libpam-systemd")
+DEPS=("python3" "python3-venv" "python3-pip" "git" "lsof" "iproute2" "dbus-user-session" "libpam-systemd")
 TARGET_LINK="/usr/local/bin/systemd-compose"
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 SOURCE_SCRIPT="$SCRIPT_DIR/systemd-compose.sh"
@@ -23,7 +24,6 @@ SOURCE_SCRIPT="$SCRIPT_DIR/systemd-compose.sh"
 echo "=== 🛠️  Host Dependency Check ==="
 
 MISSING_DEPS=()
-INSTALLED_NEW_DEPS=0
 GROUPS_CHANGED=0
 
 # 1. Check for Debian Packages
@@ -44,12 +44,10 @@ if [ ${#MISSING_DEPS[@]} -ne 0 ]; then
     echo ""
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         if [ "$EUID" -ne 0 ]; then
-            echo "pw" | sudo -S apt update
-            sudo apt install -y "${MISSING_DEPS[@]}"
+            sudo apt update && sudo apt install -y "${MISSING_DEPS[@]}"
         else
             apt update && apt install -y "${MISSING_DEPS[@]}"
         fi
-        INSTALLED_NEW_DEPS=1
     else
         echo "⚠️  Skipping installation. Framework will likely fail."
     fi
@@ -81,10 +79,15 @@ ensure_logind_service() {
 
     if [ -L "/etc/systemd/system/dbus-org.freedesktop.login1.service" ]; then
         if ! loginctl show-user "$USER" &>/dev/null; then
-             echo "⚠️  Detected conflicting D-Bus symlink. Removing..."
-             sudo rm /etc/systemd/system/dbus-org.freedesktop.login1.service
-             sudo systemctl daemon-reload
-             echo "✅ Conflict removed."
+             echo "⚠️  Detected conflicting D-Bus symlink:"
+             echo "   /etc/systemd/system/dbus-org.freedesktop.login1.service"
+             read -p "❓ Remove it so systemd-logind can take over? (Requires sudo) [y/N] " -n 1 -r
+             echo ""
+             if [[ $REPLY =~ ^[Yy]$ ]]; then
+                 sudo rm /etc/systemd/system/dbus-org.freedesktop.login1.service
+                 sudo systemctl daemon-reload
+                 echo "✅ Conflict removed."
+             fi
         fi
     fi
 }
@@ -99,10 +102,12 @@ fix_shell_environment() {
                 echo "⚠️  Systemd is running, but shell environment variables are missing."
                 echo "   Patching ~/.bashrc to fix this..."
                 if ! grep -q "XDG_RUNTIME_DIR" "$HOME/.bashrc"; then
-                    echo "" >> "$HOME/.bashrc"
-                    echo "# App-Ctl Fix: Define XDG vars for systemd user session" >> "$HOME/.bashrc"
-                    echo "export XDG_RUNTIME_DIR=\"$EXPECTED_DIR\"" >> "$HOME/.bashrc"
-                    echo "export DBUS_SESSION_BUS_ADDRESS=\"unix:path=\${XDG_RUNTIME_DIR}/bus\"" >> "$HOME/.bashrc"
+                    {
+                        echo ""
+                        echo "# systemd-compose fix: Define XDG vars for systemd user session"
+                        echo "export XDG_RUNTIME_DIR=\"$EXPECTED_DIR\""
+                        echo "export DBUS_SESSION_BUS_ADDRESS=\"unix:path=\${XDG_RUNTIME_DIR}/bus\""
+                    } >> "$HOME/.bashrc"
                     echo "✅ Fix added to ~/.bashrc"
                 fi
                 export XDG_RUNTIME_DIR="$EXPECTED_DIR"
