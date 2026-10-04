@@ -91,6 +91,10 @@ load_project_config() {
     ENTRYPOINT="${ENTRYPOINT:-}"
     ARGS="${ARGS:-}"
     DESCRIPTION="${DESCRIPTION:-$APP_NAME}"
+    STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-15}"
+    if ! [[ "$STARTUP_TIMEOUT" =~ ^[0-9]+$ ]]; then
+        STARTUP_TIMEOUT=15
+    fi
 }
 
 valid_app_name() {
@@ -218,6 +222,85 @@ check_binary() {
     return 0
 }
 
+# Fills in templates/service.unit. Values are escaped for systemd ("%" is a
+# specifier, "$" expands variables in ExecStart) and copied literally, so
+# characters such as "&" or "|" can't corrupt the file the way sed did.
+render_unit() {
+    local var value line key
+    for var in DESCRIPTION INSTALL_DIR ENTRYPOINT APP_DIR ARGS; do
+        if [[ "${!var}" == *$'\n'* ]]; then
+            die "$var in config.env must be a single line."
+        fi
+    done
+    if [[ "$INSTALL_DIR" == *[\"\\]* ]]; then
+        die "The project path can't contain '\"' or '\\': $INSTALL_DIR"
+    fi
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        key="${line%%=*}"
+        for var in DESCRIPTION INSTALL_DIR ENTRYPOINT APP_DIR ARGS; do
+            value="${!var}"
+            value="${value//%/%%}"
+            if [ "$key" == "ExecStart" ]; then
+                value="${value//\$/\$\$}"
+            fi
+            line="${line//"\${$var}"/"$value"}"
+        done
+        printf '%s\n' "$line"
+    done < "$TEMPLATE_FILE"
+}
+
+# Type=exec only catches a binary that can't be started. Watch the app for a
+# few seconds so a crash right after startup (bad import, port taken, wrong
+# PORT) is reported here instead of silently looping in the background.
+wait_for_startup() {
+    local elapsed=0 state restarts
+    local min_wait=3
+    while true; do
+        sleep 1
+        elapsed=$((elapsed + 1))
+        state=$(systemctl --user show --property ActiveState --value "${UNIT}.service")
+        restarts=$(systemctl --user show --property NRestarts --value "${UNIT}.service")
+        if [ "${restarts:-0}" != "0" ]; then
+            echo "❌ The app crashed during startup and systemd restarted it (${restarts}x)."
+            return 1
+        fi
+        if [ "$state" != "active" ]; then
+            echo "❌ The app exited during startup (state: $state)."
+            return 1
+        fi
+        if [ "$REQUIRE_PORT" == "false" ]; then
+            [ "$elapsed" -ge "$min_wait" ] && return 0
+        elif port_listening "$PORT"; then
+            return 0
+        elif [ "$elapsed" -ge "$STARTUP_TIMEOUT" ]; then
+            echo "❌ The app is running but not listening on port $PORT after ${STARTUP_TIMEOUT}s."
+            echo "   Check that ARGS binds to \$PORT, or raise STARTUP_TIMEOUT in config.env."
+            return 1
+        fi
+    done
+}
+
+# Memory of the whole service (all workers), not just the main process.
+service_memory() {
+    local bytes cgroup pids
+    bytes=$(systemctl --user show --property MemoryCurrent --value "${UNIT}.service")
+    if [[ "$bytes" =~ ^[0-9]+$ ]] && [ "$bytes" != "18446744073709551615" ]; then
+        echo "$((bytes / 1024 / 1024)) MB"
+        return
+    fi
+    # Memory accounting is off: add up every process in the service's cgroup
+    cgroup=$(systemctl --user show --property ControlGroup --value "${UNIT}.service")
+    if [ -n "$cgroup" ] && [ -r "/sys/fs/cgroup${cgroup}/cgroup.procs" ]; then
+        pids=$(paste -sd, "/sys/fs/cgroup${cgroup}/cgroup.procs")
+    else
+        pids=$(systemctl --user show --property MainPID --value "${UNIT}.service")
+    fi
+    if [ -n "$pids" ] && [ "$pids" != "0" ]; then
+        ps -o rss= -p "$pids" 2>/dev/null | awk '{ kb += $1 } END { print int(kb / 1024) " MB" }'
+    fi
+}
+
 show_recent_logs() {
     echo "--- 📜 Last ${1} Log Lines ---"
     journalctl --user -u "${UNIT}.service" -n "$1" --no-pager
@@ -271,16 +354,14 @@ run() {
 
     mkdir -p "$SYSTEMD_DIR"
 
-    sed \
-        -e "s|\${DESCRIPTION}|$DESCRIPTION|g" \
-        -e "s|\${INSTALL_DIR}|$INSTALL_DIR|g" \
-        -e "s|\${ENTRYPOINT}|$ENTRYPOINT|g" \
-        -e "s|\${APP_DIR}|$APP_DIR|g" \
-        -e "s|\${ARGS}|$ARGS|g" \
-        "$TEMPLATE_FILE" > "$SERVICE_FILE"
+    local unit_content
+    unit_content=$(render_unit) || exit 1
+    printf '%s\n' "$unit_content" > "$SERVICE_FILE"
 
     systemctl --user daemon-reload
     systemctl --user enable --quiet "${UNIT}.service"
+    # Clear a previous "failed" state so the start limit doesn't block us
+    systemctl --user reset-failed "${UNIT}.service" 2>/dev/null
 
     if ! systemctl --user start "${UNIT}.service"; then
         echo ""
@@ -289,8 +370,12 @@ run() {
         exit 1
     fi
 
-    echo "Service started."
-    sleep 1
+    if ! wait_for_startup; then
+        show_recent_logs 15
+        exit 1
+    fi
+
+    echo "✅ Service started."
     status
 }
 
@@ -315,10 +400,9 @@ restart() {
         exit 1
     fi
 
-    systemctl --user restart "${UNIT}.service"
-    sleep 1
+    systemctl --user reset-failed "${UNIT}.service" 2>/dev/null
 
-    if systemctl --user is-active --quiet "${UNIT}.service"; then
+    if systemctl --user restart "${UNIT}.service" && wait_for_startup; then
         echo "✅ Restarted successfully."
         status
     else
@@ -335,9 +419,9 @@ status() {
     echo "Service State:  $IS_ACTIVE"
     if [ "$IS_ACTIVE" == "active" ]; then
         MAIN_PID=$(systemctl --user show --property MainPID --value "${UNIT}.service")
-        MEM_USAGE=$(ps -o rss= -p "$MAIN_PID" 2>/dev/null | awk '{print int($1/1024) " MB"}')
         echo "Main PID:       $MAIN_PID"
-        echo "Memory Usage:   $MEM_USAGE"
+        echo "Memory Usage:   $(service_memory)"
+        echo "Restarts:       $(systemctl --user show --property NRestarts --value "${UNIT}.service")"
     fi
 
     if [ "$REQUIRE_PORT" == "false" ]; then
@@ -438,6 +522,7 @@ start_all() {
         IFS='|' read -r name _ _ _ <<< "$(project_summary "$proj")"
         if valid_app_name "$name" && [ -f "$SYSTEMD_DIR/${name}.service" ]; then
             printf "Starting %-25s ... " "$name"
+            systemctl --user reset-failed "${name}.service" 2>/dev/null
             if systemctl --user start "${name}.service"; then
                 echo "✅ Triggered"
             else
@@ -478,7 +563,13 @@ ps_dashboard() {
                 active)     display_status="RUNNING" ;;
                 inactive)   display_status="STOPPED" ;;
                 failed)     display_status="CRASHED" ;;
-                activating) display_status="STARTING" ;;
+                activating)
+                    if [ "$(systemctl --user show --property SubState --value "${name}.service")" == "auto-restart" ]; then
+                        display_status="RESTARTING"
+                    else
+                        display_status="STARTING"
+                    fi
+                    ;;
                 *)          display_status="${raw_status:-unknown}" ;;
             esac
         fi
