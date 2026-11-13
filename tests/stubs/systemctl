@@ -27,7 +27,7 @@ done
 cmd="${args[0]:-}"
 unit="${args[${#args[@]}-1]}"
 unit="${unit%.service}"
-unit_file="$HOME/.config/systemd/user/$unit.service"
+unit_file="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$unit.service"
 
 state() { cat "$STATE_DIR/units/$unit" 2>/dev/null || echo inactive; }
 set_state() { echo "$1" > "$STATE_DIR/units/$unit"; }
@@ -72,7 +72,7 @@ case "$cmd" in
         fi
         set_state "${STUB_STATE_AFTER_START:-active}"
         if [ -n "${STUB_LISTEN:-}" ] && [ "$(state)" == "active" ]; then
-            echo "$STUB_LISTEN $unit" >> "$STATE_DIR/ports"
+            echo "$STUB_LISTEN ${STUB_SOCKET_OWNER:-$unit}" >> "$STATE_DIR/ports"
         fi
         exit 0
         ;;
@@ -102,6 +102,7 @@ case "$cmd" in
             WorkingDirectory) grep '^WorkingDirectory=' "$unit_file" 2>/dev/null | cut -d= -f2- ;;
             MainPID) if [ "$(state)" == "active" ]; then echo "$$"; else echo 0; fi ;;
             ActiveState) state ;;
+            ControlGroup) awk -F: 'NR == 1 { print $3 }' /proc/self/cgroup ;;
             SubState) echo "${STUB_SUBSTATE:-running}" ;;
             NRestarts) echo "${STUB_NRESTARTS:-0}" ;;
             MemoryCurrent) echo "${STUB_MEM:-[not set]}" ;;

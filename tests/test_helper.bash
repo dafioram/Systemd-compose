@@ -11,6 +11,7 @@ SDC="$REPO_DIR/systemd-compose.sh"
 setup() {
     TEST_ROOT="$(mktemp -d)"
     export HOME="$TEST_ROOT/home"
+    unset XDG_CONFIG_HOME
     export STUB_STATE="$TEST_ROOT/state"
     export PATH="$REPO_DIR/tests/stubs:$PATH"
     mkdir -p "$HOME" "$STUB_STATE"

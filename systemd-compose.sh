@@ -5,7 +5,7 @@ set -uo pipefail
 # --- GLOBAL CONFIGURATION LOADING ---
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 TEMPLATE_FILE="$SCRIPT_DIR/templates/service.unit"
-SYSTEMD_DIR="$HOME/.config/systemd/user"
+SYSTEMD_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 # Every service systemd-compose creates is named "sdc-<APP_NAME>.service".
 # The prefix keeps apps from clashing with other user services and lets
@@ -120,7 +120,7 @@ load_project_config() {
     STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-15}"
     MEMORY_MAX="${MEMORY_MAX:-}"
     CPU_QUOTA="${CPU_QUOTA:-}"
-    if ! [[ "$STARTUP_TIMEOUT" =~ ^[0-9]+$ ]]; then
+    if ! [[ "$STARTUP_TIMEOUT" =~ ^[1-9][0-9]{0,8}$ ]]; then
         STARTUP_TIMEOUT=15
     fi
 }
@@ -137,8 +137,39 @@ valid_app_name() {
     [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
 }
 
+# Return 0 for a listener, 1 for no listener, and 2 when ss failed.
 port_listening() {
-    ss -tuln 2>/dev/null | grep -qE ":$1[[:space:]]"
+    local sockets
+    sockets=$(ss -H -ltn "sport = :$1") || return 2
+    [ -n "$sockets" ]
+}
+
+service_listening() {
+    local cgroup sockets remaining pid path
+    local -a paths
+    cgroup=$(systemctl --user show --property ControlGroup --value "${UNIT}.service") || return 2
+    [ -n "$cgroup" ] || return 1
+    sockets=$(ss -H -ltnp "sport = :$1") || return 2
+    remaining="$sockets"
+    while [[ "$remaining" =~ pid=([0-9]+), ]]; do
+        pid="${BASH_REMATCH[1]}"
+        remaining="${remaining#*"${BASH_REMATCH[0]}"}"
+        if mapfile -t paths 2>/dev/null < "/proc/$pid/cgroup"; then
+            for path in "${paths[@]}"; do
+                path="${path#*:*:}"
+                if [[ "$path" == "$cgroup" || "$path" == "${cgroup%/}/"* ]]; then
+                    return 0
+                fi
+            done
+        fi
+    done
+    return 1
+}
+
+installed_port() {
+    PORT=$(unit_meta "$SERVICE_FILE" Port)
+    REQUIRE_PORT=false
+    if [ -n "$PORT" ]; then REQUIRE_PORT=true; fi
 }
 
 # --- ARGUMENT PARSING ---
@@ -254,35 +285,41 @@ warn_config_exports() {
 }
 
 validate_port() {
-    if [ "$REQUIRE_PORT" == "false" ]; then
-        return 0
-    fi
+    case "$REQUIRE_PORT" in
+        false) PORT=""; return 0 ;;
+        true) ;;
+        *) die "REQUIRE_PORT must be true or false." ;;
+    esac
 
     if [ -z "$PORT" ]; then
         echo "❌ Error: REQUIRE_PORT=true, but 'PORT' variable is missing in .env."
         return 1
     fi
 
-    if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-        echo "❌ Error: PORT='$PORT' is not a valid port number."
-        return 1
+    if [[ "$PORT" =~ ^0*([1-9][0-9]{0,4})$ ]] && [ "${BASH_REMATCH[1]}" -le 65535 ]; then
+        PORT="${BASH_REMATCH[1]}"
+        return 0
     fi
-
-    return 0
+    echo "❌ Error: PORT='$PORT' is not a valid port number."
+    return 1
 }
 
 check_port() {
-    [ "$REQUIRE_PORT" == "false" ] && return 0
-    if port_listening "$PORT"; then
-        echo "❌ Error: Port $PORT is already in use."
-        echo "   Process blocking this port:"
-        if ! lsof -nP -i ":$PORT" -sTCP:LISTEN 2>/dev/null; then
-            echo "   (Owned by another user. Try: sudo lsof -i :$PORT)"
-        fi
-        return 1
-    fi
+    [ "$REQUIRE_PORT" == false ] && return 0
+    local result=0
+    port_listening "$PORT" || result=$?
+    case "$result" in
+        0)
+            echo "❌ Error: Port $PORT is already in use."
+            lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || :
+            return 1
+            ;;
+        2)
+            echo "❌ Error: Could not inspect TCP port $PORT." >&2
+            return 1
+            ;;
+    esac
     echo "✅ Port $PORT is free."
-    return 0
 }
 
 check_binary() {
@@ -347,13 +384,13 @@ render_unit() {
 # few seconds so a crash right after startup (bad import, port taken, wrong
 # PORT) is reported here instead of silently looping in the background.
 wait_for_startup() {
-    local elapsed=0 state restarts
+    local elapsed=0 state restarts result
     local min_wait=3
     while true; do
         sleep 1
         elapsed=$((elapsed + 1))
-        state=$(systemctl --user show --property ActiveState --value "${UNIT}.service")
-        restarts=$(systemctl --user show --property NRestarts --value "${UNIT}.service")
+        state=$(systemctl --user show --property ActiveState --value "${UNIT}.service") || return 1
+        restarts=$(systemctl --user show --property NRestarts --value "${UNIT}.service") || return 1
         if [ "${restarts:-0}" != "0" ]; then
             echo "❌ The app crashed during startup and systemd restarted it (${restarts}x)."
             return 1
@@ -364,12 +401,19 @@ wait_for_startup() {
         fi
         if [ "$REQUIRE_PORT" == "false" ]; then
             [ "$elapsed" -ge "$min_wait" ] && return 0
-        elif port_listening "$PORT"; then
-            return 0
-        elif [ "$elapsed" -ge "$STARTUP_TIMEOUT" ]; then
-            echo "❌ The app is running but not listening on port $PORT after ${STARTUP_TIMEOUT}s."
-            echo "   Check that ARGS binds to \$PORT, or raise STARTUP_TIMEOUT in config.env."
-            return 1
+        else
+            result=0
+            service_listening "$PORT" || result=$?
+            if [ "$result" == 0 ]; then return 0; fi
+            if [ "$result" == 2 ]; then
+                echo "❌ Could not inspect the service's TCP listener." >&2
+                return 1
+            fi
+            if [ "$elapsed" -ge "$STARTUP_TIMEOUT" ]; then
+                echo "❌ The app is running but not listening on port $PORT after ${STARTUP_TIMEOUT}s."
+                echo "   Check the app binds to this TCP port and exposes a listener PID, or raise STARTUP_TIMEOUT."
+                return 1
+            fi
         fi
     done
 }
@@ -380,7 +424,12 @@ warn_unenforced_limits() {
     local uid controllers_file controllers
     uid=$(id -u)
     controllers_file="/sys/fs/cgroup/user.slice/user-${uid}.slice/user@${uid}.service/cgroup.controllers"
-    [ -r "$controllers_file" ] || return 0
+    if [ ! -r "$controllers_file" ]; then
+        if [ -n "$MEMORY_MAX$CPU_QUOTA" ]; then
+            echo "⚠️  Could not verify cgroup v2 controller availability for user services."
+        fi
+        return 0
+    fi
     controllers=" $(cat "$controllers_file") "
     if [ -n "$MEMORY_MAX" ] && [[ "$controllers" != *" memory "* ]]; then
         echo "⚠️  MEMORY_MAX is set, but the memory controller isn't available to user services, so it won't be enforced."
@@ -640,7 +689,9 @@ restart() {
         exit 1
     fi
 
-    systemctl --user reset-failed "${UNIT}.service" 2>/dev/null
+    installed_port
+    validate_port || return 1
+    systemctl --user reset-failed "${UNIT}.service" 2>/dev/null || :
 
     if systemctl --user restart "${UNIT}.service" && wait_for_startup; then
         echo "✅ Restarted successfully."
@@ -653,6 +704,12 @@ restart() {
 }
 
 status() {
+    local PORT="" REQUIRE_PORT=false memory_limit=""
+    if [ -f "$SERVICE_FILE" ]; then
+        installed_port
+        validate_port || return 1
+        memory_limit=$(sed -n 's/^MemoryMax=//p' "$SERVICE_FILE")
+    fi
     echo "--- 📊 Status: ${APP_NAME} ---"
     IS_ACTIVE=$(systemctl --user is-active "${UNIT}.service" 2>/dev/null)
 
@@ -660,14 +717,14 @@ status() {
     if [ "$IS_ACTIVE" == "active" ]; then
         MAIN_PID=$(systemctl --user show --property MainPID --value "${UNIT}.service")
         echo "Main PID:       $MAIN_PID"
-        echo "Memory Usage:   $(service_memory)${MEMORY_MAX:+ (limit $MEMORY_MAX)}"
+        echo "Memory Usage:   $(service_memory)${memory_limit:+ (limit $memory_limit)}"
         echo "Restarts:       $(systemctl --user show --property NRestarts --value "${UNIT}.service")"
     fi
 
     if [ "$REQUIRE_PORT" == "false" ]; then
         echo "Port:           N/A (Background Service)"
     elif [ -n "$PORT" ]; then
-        if port_listening "$PORT"; then
+        if service_listening "$PORT"; then
             echo "Port $PORT:      ✅ Listening"
         else
             echo "Port $PORT:      ❌ Not Listening"

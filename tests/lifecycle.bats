@@ -221,3 +221,22 @@ load test_helper
     [ ! -e "$previous" ]
     [ ! -L "$TEST_ROOT/app/venv" ]
 }
+
+@test "restart checks the port in the installed unit" {
+    make_app "$TEST_ROOT/app" app true 8000
+    export STUB_LISTEN=8000
+    bash "$SDC" "$TEST_ROOT/app" run
+    printf 'PORT=9000\n' > "$TEST_ROOT/app/.env"
+    run bash "$SDC" "$TEST_ROOT/app" restart
+    [ "$status" -eq 0 ]
+    assert_output_contains "Port 8000"
+}
+
+@test "a TCP listener without an owned PID does not pass readiness" {
+    make_app "$TEST_ROOT/app" app true 8000
+    echo 'STARTUP_TIMEOUT=1' >> "$TEST_ROOT/app/config.env"
+    STUB_LISTEN=8000 STUB_SOCKET_OWNER=another-app run bash "$SDC" "$TEST_ROOT/app" run
+    [ "$status" -eq 1 ]
+    assert_output_contains "not listening on port 8000"
+    [ ! -e "$UNIT_DIR/sdc-app.service" ]
+}

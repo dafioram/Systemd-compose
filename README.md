@@ -262,7 +262,7 @@ Limits need the kernel's memory/CPU controllers to be available to user services
 
 After starting the app, `run`/`up`/`restart` watch it before reporting success:
 
-* **Apps with a port:** succeed as soon as `PORT` is listening. They fail if the app crashes, or if it isn't listening after `STARTUP_TIMEOUT` seconds.
+* **Apps with a port:** succeed when a TCP listener on `PORT` belongs to the service’s cgroup. The CLI needs to be able to see that listener’s PID. They fail if the app crashes, or if it isn't listening after `STARTUP_TIMEOUT` seconds.
 * **Background apps** (`REQUIRE_PORT="false"`): succeed if the app is still running, without restarts, after 3 seconds.
 
 On failure the last log lines are printed and the command exits with an error.
@@ -275,7 +275,7 @@ User services can't wait for the system's network to come up at boot, so apps th
 
 ## 🔧 Under the Hood
 
-`run` writes `~/.config/systemd/user/sdc-<APP_NAME>.service` from [`templates/service.unit`](templates/service.unit). The service file records which project folder owns it (`X-SDC-Project=`); that is how `ps` finds your apps and how name conflicts are detected.
+`run` writes `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/sdc-<APP_NAME>.service` from [`templates/service.unit`](templates/service.unit). The service file records which project folder owns it (`X-SDC-Project=`); that is how `ps` finds your apps and how name conflicts are detected.
 
 Because these are ordinary systemd user services, the usual tools work too:
 
