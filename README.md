@@ -4,17 +4,13 @@ A **rootless**, **Docker-like** process manager for Python applications on Debia
 
 **Systemd-compose** allows you to manage Python projects (Flask, FastAPI, scripts, bots) using a familiar workflow (`build`, `up`, `down`, `logs`) without the overhead or complexity of Docker containers. It leverages native Linux tools (`systemd --user`, `venv`, `pip`) to ensure your apps are robust, isolated, and auto-start on boot—all without needing `sudo` for day-to-day operations.
 
-## ⚖️ Why Systemd-compose?
+## Why Systemd-compose?
 
-Get the developer experience of Docker without the resource cost.
-
-| Feature | Docker | Systemd-compose |
-| :--- | :--- | :--- |
-| **Isolation** | Heavy (Container Virtualization) | Light (Venv / Native Process) |
-| **RAM Usage** | High (Daemon + Container Overhead) | **Near Zero** (Native OS usage only) |
-| **Disk Space** | Heavy (Duplicated OS layers) | **Tiny** (Shared OS libs) |
-| **Management** | `docker compose up` | `systemd-compose up` |
-| **Best For** | Cloud / Complex Deps | Raspberry Pi / Home Lab / Old PCs |
+Use Compose-style commands to manage one Python service per project. Each app
+gets a Python virtual environment for dependencies and a standard systemd user
+unit for boot startup, supervision, and logs. It runs as your host user and
+uses the host's filesystem and network. Docker packages applications as images
+with reusable layers and provides container isolation and multi-service stacks.
 
 ---
 
@@ -23,7 +19,7 @@ Get the developer experience of Docker without the resource cost.
 * **Rootless Architecture:** Runs entirely in userspace using `systemd --user`.
 * **Docker-like CLI:** Commands like `up`, `down`, `ps`, `logs` and `exec` make it easy to learn.
 * **Isolated Environments:** Automatically creates and manages a Python `venv` for each project.
-* **Namespaced Services:** Every app runs as `sdc-<APP_NAME>.service`, so it can never replace one of your other user services.
+* **Namespaced Services:** Every app runs as `sdc-<APP_NAME>.service`, and records its owning project.
 * **Conflict Detection:** Prevents two project folders from claiming the same app name.
 * **Resource Limits:** Cap an app's memory and CPU so one runaway app can't take down your Pi.
 * **Crash Detection:** `up` waits until your app is actually running (and listening on its port) and shows the logs if it isn't. Crash loops end as **CRASHED** instead of restarting forever.
@@ -51,13 +47,13 @@ cd ~/systemd-compose
 ./host-setup.sh
 ```
 
-The script asks before changing anything. It:
+Run the script as the user who will own the services. It prompts before making changes. It:
 
 1. Installs missing packages: `python3`, `python3-venv`, `python3-pip`, `git`, `lsof`, `iproute2`, `dbus-user-session`, `libpam-systemd`.
 2. Fixes minimal systems such as DietPi (masked `systemd-logind`, missing `XDG_RUNTIME_DIR`).
 3. Makes sure `logs` and `status` can show your apps' output. If the system journal is kept only in memory (common on DietPi and other minimal images), you can't read your own apps' logs. The script offers to store the journal on disk (`/etc/systemd/journald.conf.d/99-systemd-compose.conf`), after which each user can read their own logs. If you decline, it offers the `systemd-journal` group instead, which can read **all** system logs.
 4. Enables **linger** for your user, so apps start at boot and keep running after you log out.
-5. Links `systemd-compose` into `/usr/local/bin`.
+5. Offers to link `systemd-compose` into `~/.local/bin`. Add this directory to your `PATH` or invoke the command by its full path.
 
 You need `sudo` only for this step. If you were added to a group, **log out and back in** before continuing.
 
@@ -330,7 +326,9 @@ CI runs both on every pull request.
 systemd-compose down --volumes
 
 # Remove the command
-sudo rm /usr/local/bin/systemd-compose
+rm ~/.local/bin/systemd-compose
+# For installations created by older versions, remove the old link if present:
+# sudo rm /usr/local/bin/systemd-compose
 
 # (Optional) Stop user services from running without a login session
 loginctl disable-linger $USER

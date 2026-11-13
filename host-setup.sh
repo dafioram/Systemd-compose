@@ -9,7 +9,7 @@
 # dbus-user-session: REQUIRED for 'systemctl --user' on minimal distros (DietPi)
 # libpam-systemd:    Triggers systemd startup on login
 DEPS=("python3" "python3-venv" "python3-pip" "git" "lsof" "iproute2" "dbus-user-session" "libpam-systemd")
-TARGET_LINK="/usr/local/bin/systemd-compose"
+TARGET_LINK="$HOME/.local/bin/systemd-compose"
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 SOURCE_SCRIPT="$SCRIPT_DIR/systemd-compose.sh"
 
@@ -77,9 +77,12 @@ ensure_log_access() {
     read -p "❓ Add user '$USER' to the group? (Requires sudo) [y/N] " -n 1 -r
     echo ""
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        sudo usermod -aG systemd-journal "$USER"
-        echo "✅ User added to group."
-        GROUPS_CHANGED=1
+        if sudo usermod -aG systemd-journal "$USER"; then
+            echo "✅ User added to group."
+            GROUPS_CHANGED=1
+        else
+            echo "❌ Failed to add user to the journal group." >&2
+        fi
     else
         echo "⚠️  Skipped. 'systemd-compose logs' may show nothing."
     fi
@@ -91,6 +94,11 @@ if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
 fi
 
 # --- OS COMPATIBILITY CHECK ---
+
+if [ "$EUID" -eq 0 ]; then
+    echo "❌ Run setup as the account that will own the services." >&2
+    exit 1
+fi
 if ! command -v apt-get &> /dev/null; then
     echo "❌ Error: This script supports Debian/Ubuntu based systems only."
     echo "   (Raspbian, DietPi, Ubuntu, Mint, etc.)"
@@ -120,10 +128,9 @@ if [ ${#MISSING_DEPS[@]} -ne 0 ]; then
     read -p "❓ Install them now? (Requires sudo) [y/N] " -n 1 -r
     echo ""
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        if [ "$EUID" -ne 0 ]; then
-            sudo apt update && sudo apt install -y "${MISSING_DEPS[@]}"
-        else
-            apt update && apt install -y "${MISSING_DEPS[@]}"
+        if ! (sudo apt update && sudo apt install -y "${MISSING_DEPS[@]}"); then
+            echo "❌ Failed to install dependencies." >&2
+            exit 1
         fi
     else
         echo "⚠️  Skipping installation. Framework will likely fail."
@@ -154,11 +161,16 @@ ensure_logind_service() {
     
     if [ "$IS_MASKED" == "masked" ]; then
         echo "⚠️  Detected masked systemd-logind (Common on DietPi)."
-        echo "   Unmasking and starting login manager..."
-        sudo systemctl unmask systemd-logind
-        sudo systemctl daemon-reload
-        sudo systemctl start systemd-logind
-        echo "✅ systemd-logind unmasked and started."
+        read -r -p "Unmask and start systemd-logind? (Requires sudo) [y/N] "
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            if sudo systemctl unmask systemd-logind &&
+                sudo systemctl daemon-reload &&
+                sudo systemctl start systemd-logind; then
+                echo "✅ systemd-logind unmasked and started."
+            else
+                echo "❌ Failed to unmask or start systemd-logind." >&2
+            fi
+        fi
     fi
 
     if [ -L "/etc/systemd/system/dbus-org.freedesktop.login1.service" ]; then
@@ -168,9 +180,12 @@ ensure_logind_service() {
              read -p "❓ Remove it so systemd-logind can take over? (Requires sudo) [y/N] " -n 1 -r
              echo ""
              if [[ $REPLY =~ ^[Yy]$ ]]; then
-                 sudo rm /etc/systemd/system/dbus-org.freedesktop.login1.service
-                 sudo systemctl daemon-reload
-                 echo "✅ Conflict removed."
+                 if sudo rm /etc/systemd/system/dbus-org.freedesktop.login1.service &&
+                     sudo systemctl daemon-reload; then
+                     echo "✅ Conflict removed."
+                 else
+                     echo "❌ Could not remove or reload the conflicting alias." >&2
+                 fi
              fi
         fi
     fi
@@ -184,15 +199,15 @@ fix_shell_environment() {
             EXPECTED_DIR="/run/user/$(id -u)"
             if [ -d "$EXPECTED_DIR" ]; then
                 echo "⚠️  Systemd is running, but shell environment variables are missing."
-                echo "   Patching ~/.bashrc to fix this..."
-                if ! grep -q "XDG_RUNTIME_DIR" "$HOME/.bashrc"; then
-                    {
-                        echo ""
-                        echo "# systemd-compose fix: Define XDG vars for systemd user session"
-                        echo "export XDG_RUNTIME_DIR=\"$EXPECTED_DIR\""
-                        echo "export DBUS_SESSION_BUS_ADDRESS=\"unix:path=\${XDG_RUNTIME_DIR}/bus\""
-                    } >> "$HOME/.bashrc"
-                    echo "✅ Fix added to ~/.bashrc"
+                if ! grep -q "XDG_RUNTIME_DIR" "$HOME/.bashrc" 2>/dev/null; then
+                    read -r -p "Add the user bus settings to ~/.bashrc? [y/N] "
+                    if [[ $REPLY =~ ^[Yy]$ ]]; then
+                        if printf '\n# systemd-compose user session settings\nexport XDG_RUNTIME_DIR="%s"\nexport DBUS_SESSION_BUS_ADDRESS="unix:path=\${XDG_RUNTIME_DIR}/bus"\n'                             "$EXPECTED_DIR" >> "$HOME/.bashrc"; then
+                            echo "✅ Settings added to ~/.bashrc."
+                        else
+                            echo "❌ Could not update ~/.bashrc." >&2
+                        fi
+                    fi
                 fi
                 export XDG_RUNTIME_DIR="$EXPECTED_DIR"
                 export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
@@ -235,28 +250,23 @@ fi
 
 echo "--- 🔗 Symlink Setup ---"
 
-# Ensure the main script is executable
-if [ ! -x "$SOURCE_SCRIPT" ]; then
-    echo "🔧 Making systemd-compose.sh executable..."
-    chmod +x "$SOURCE_SCRIPT"
-fi
-
-if [ -L "$TARGET_LINK" ]; then
-    CURRENT_DEST=$(readlink -f "$TARGET_LINK")
-    if [ "$CURRENT_DEST" == "$SOURCE_SCRIPT" ]; then
-        echo "✅ Symlink already exists and is correct."
-    else
-        echo "⚠️  Symlink points to wrong location: $CURRENT_DEST"
-        echo "   Updating to: $SOURCE_SCRIPT"
-        sudo ln -sf "$SOURCE_SCRIPT" "$TARGET_LINK"
-        echo "✅ Symlink updated."
-    fi
-elif [ -e "$TARGET_LINK" ]; then
-    echo "❌ Error: $TARGET_LINK exists but is not a symlink. Manual fix required."
+if [ -L "$TARGET_LINK" ] && [ "$(readlink -f "$TARGET_LINK")" == "$SOURCE_SCRIPT" ]; then
+    echo "✅ Symlink already exists and is correct."
+elif [ -L "$TARGET_LINK" ] || [ -e "$TARGET_LINK" ]; then
+    echo "❌ $TARGET_LINK already exists. Move it aside and rerun setup." >&2
+    exit 1
 else
-    echo "Creating symlink..."
-    sudo ln -s "$SOURCE_SCRIPT" "$TARGET_LINK"
-    echo "✅ Symlink created at $TARGET_LINK"
+    read -r -p "Install the CLI symlink at $TARGET_LINK? [y/N] "
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        if ! mkdir -p "$(dirname "$TARGET_LINK")" || ! ln -s "$SOURCE_SCRIPT" "$TARGET_LINK"; then
+            echo "❌ Could not create $TARGET_LINK." >&2
+            exit 1
+        fi
+        echo "✅ Symlink created at $TARGET_LINK"
+    fi
+fi
+if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+    echo 'Add ~/.local/bin to PATH or invoke ~/.local/bin/systemd-compose directly.'
 fi
 
 echo "=== Setup Complete ==="
