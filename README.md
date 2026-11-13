@@ -2,15 +2,12 @@
 
 A **rootless**, **Docker-like** process manager for Python applications on Debian/Ubuntu systems.
 
-**Systemd-compose** allows you to manage Python projects (Flask, FastAPI, scripts, bots) using a familiar workflow (`build`, `up`, `down`, `logs`) without the overhead or complexity of Docker containers. It leverages native Linux tools (`systemd --user`, `venv`, `pip`) to ensure your apps are robust, isolated, and auto-start on boot—all without needing `sudo` for day-to-day operations.
-
-## Why Systemd-compose?
-
-Use Compose-style commands to manage one Python service per project. Each app
-gets a Python virtual environment for dependencies and a standard systemd user
-unit for boot startup, supervision, and logs. It runs as your host user and
-uses the host's filesystem and network. Docker packages applications as images
-with reusable layers and provides container isolation and multi-service stacks.
+Use Compose-style commands to manage one Python service per project on Debian
+or Ubuntu. Each app gets a virtual environment for dependencies and a
+standard systemd user unit for boot startup, supervision, and logs. It runs as
+your host user and uses the host's filesystem and network. Docker packages
+applications as images with reusable layers and provides container isolation
+and multi-service stacks.
 
 ---
 
@@ -18,11 +15,11 @@ with reusable layers and provides container isolation and multi-service stacks.
 
 * **Rootless Architecture:** Runs entirely in userspace using `systemd --user`.
 * **Docker-like CLI:** Commands like `up`, `down`, `ps`, `logs` and `exec` make it easy to learn.
-* **Isolated Environments:** Automatically creates and manages a Python `venv` for each project.
+* **Virtual Environments:** Automatically creates and manages a Python `venv` for each project.
 * **Namespaced Services:** Every app runs as `sdc-<APP_NAME>.service`, and records its owning project.
 * **Conflict Detection:** Prevents two project folders from claiming the same app name.
 * **Resource Limits:** Cap an app's memory and CPU so one runaway app can't take down your Pi.
-* **Crash Detection:** `up` waits until your app is actually running (and listening on its port) and shows the logs if it isn't. Crash loops end as **CRASHED** instead of restarting forever.
+* **Crash Detection:** `up` checks that the service is running (and owns its TCP listener when a port is configured) and shows the logs if it isn't. Crash loops end as **CRASHED** instead of restarting forever.
 * **Global Dashboard:** `ps` shows every app you've started, wherever its project folder lives.
 * **Flexible:** Runs anything installed in the venv: plain Python scripts, Uvicorn (FastAPI), Gunicorn (Flask/Django), or `python -m http.server` for a static site.
 

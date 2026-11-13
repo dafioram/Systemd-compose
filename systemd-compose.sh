@@ -685,7 +685,7 @@ run() (
 
     committed=1
     echo "✅ Service started."
-    status
+    status || echo "⚠️  The service started, but its status could not be displayed." >&2
 )
 
 stop() {
@@ -715,7 +715,7 @@ restart() {
 
     if systemctl --user restart "${UNIT}.service" && wait_for_startup; then
         echo "✅ Restarted successfully."
-        status
+        status || echo "⚠️  The service restarted, but its status could not be displayed." >&2
     else
         echo "❌ Restart Failed."
         show_recent_logs 10
@@ -731,7 +731,12 @@ status() {
         memory_limit=$(sed -n 's/^MemoryMax=//p' "$SERVICE_FILE")
     fi
     echo "--- 📊 Status: ${APP_NAME} ---"
-    IS_ACTIVE=$(systemctl --user is-active "${UNIT}.service" 2>/dev/null)
+    local IS_ACTIVE
+    IS_ACTIVE=$(systemctl --user is-active "${UNIT}.service") || :
+    if [ -z "$IS_ACTIVE" ]; then
+        echo "❌ Could not query service state." >&2
+        return 1
+    fi
 
     echo "Service State:  $IS_ACTIVE"
     if [ "$IS_ACTIVE" == "active" ]; then
@@ -826,6 +831,7 @@ exec_command() {
 # the installed one. Nothing is changed.
 show_config() {
     local unit_content
+    validate_port || return 1
     unit_content=$(render_unit) || exit 1
     echo "# $SERVICE_FILE"
     printf '%s\n' "$unit_content"
@@ -902,7 +908,7 @@ ps_dashboard() {
     printf "%-25s %-12s %-8s %-6s %-12s %s\n" "APP NAME" "STATUS" "PID" "PORT" "UPTIME" "PROJECT"
     echo "$line"
 
-    local file unit project port raw_status display_status pid uptime
+    local file unit project port raw_status display_status pid uptime failed=0
     while IFS= read -r file; do
         [ -n "$file" ] || continue
         unit=$(unit_from_file "$file")
@@ -913,7 +919,8 @@ ps_dashboard() {
 
         # is-active prints the state and exits non-zero for anything but
         # "active"; we only want the printed state.
-        raw_status=$(systemctl --user is-active "${unit}.service" 2>/dev/null)
+        raw_status=$(systemctl --user is-active "${unit}.service") || :
+        if [ -z "$raw_status" ]; then failed=1; fi
         case "$raw_status" in
             active)     display_status="RUNNING" ;;
             inactive)   display_status="STOPPED" ;;
@@ -943,6 +950,7 @@ ps_dashboard() {
         printf "%-25s %-12s %-8s %-6s %-12s %s\n" "${unit#"$UNIT_PREFIX"}" "$display_status" "$pid" "${port:--}" "${uptime:--}" "$project"
     done <<< "$(managed_service_files)"
     echo "$line"
+    return "$failed"
 }
 
 # --- DISPATCHER ---
