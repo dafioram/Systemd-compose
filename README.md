@@ -176,6 +176,7 @@ Run these inside a project folder, or put the folder first: `systemd-compose ~/m
 | `systemd-compose up` | **Recommended.** `build` + `run` (like `docker compose up`). |
 | `systemd-compose build` | Creates the `venv` and installs `requirements.txt`. Stops if `pip` fails. |
 | `systemd-compose run` | Writes the service file and (re)starts the app, then waits until it is running. Safe to re-run while the app is running. |
+| `systemd-compose adopt` | Reinstall and start an orphaned service from its moved project folder. Build the venv at the new path first if needed. |
 | `systemd-compose restart` | Restarts the app with the existing service file. Picks up `.env` changes. |
 | `systemd-compose stop` | Stops the app (keeps the venv and logs). It still starts again at boot. |
 | `systemd-compose down` | Stops the app and removes the service. Keeps the venv, so the next `up` is fast. |
@@ -199,7 +200,7 @@ To manage a project folder whose name matches a command (e.g. a folder called `l
 | `systemd-compose stop-all` | Stops every installed app. |
 | `systemd-compose start-all` | Starts every installed app. |
 
-`ps` statuses: **RUNNING**, **STOPPED**, **STARTING**, **RESTARTING** (crashed, systemd will retry in a few seconds), **CRASHED** (systemd gave up; fix it and `run` again). A project folder marked `(missing)` was moved or deleted; run `down` from its new location, or remove the service by hand (see [Under the Hood](#-under-the-hood)).
+`ps` statuses: **RUNNING**, **STOPPED**, **STARTING**, **RESTARTING** (crashed, systemd will retry in a few seconds), **CRASHED** (systemd gave up; fix it and `run` again). A project folder marked `(missing)` was moved or deleted. Run `adopt` from its new location to install and start it there, or remove the service by hand (see [Under the Hood](#-under-the-hood)).
 
 ---
 

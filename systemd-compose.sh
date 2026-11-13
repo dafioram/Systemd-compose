@@ -21,7 +21,7 @@ RESERVED_ENV_KEYS=" PATH HOME USER SHELL IFS PWD OLDPWD UID EUID PPID SHLVL SCRI
 
 # --- HELPER FUNCTIONS ---
 
-PROJECT_COMMANDS=" up down build run start stop restart status logs exec config "
+PROJECT_COMMANDS=" up down build run start adopt stop restart status logs exec config "
 GLOBAL_COMMANDS=" ps stop-all start-all "
 
 usage() {
@@ -32,6 +32,7 @@ usage() {
     echo "  up                 Build the venv, then install and start the app"
     echo "  build              Create the venv and install requirements.txt"
     echo "  run                Write the service file and (re)start the app"
+    echo "  adopt              Reinstall an orphaned unit from a moved project"
     echo "  restart            Restart the app with the existing service file"
     echo "  stop               Stop the app"
     echo "  down [--volumes]   Stop and remove the service (--volumes also deletes the venv)"
@@ -210,33 +211,39 @@ if [ -n "$PROJECT_DIR_ARG" ]; then
     SERVICE_FILE="$SYSTEMD_DIR/${UNIT}.service"
 fi
 
+managed_service_file() {
+    local file="$1" project
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    project=$(unit_meta "$file" Project)
+    [[ "$project" == /* ]]
+}
+
 check_name_collision() {
-    # If the service file doesn't exist, we are safe (new app)
-    if [ ! -f "$SERVICE_FILE" ]; then
+    local existing
+    if [ ! -e "$SERVICE_FILE" ] && [ ! -L "$SERVICE_FILE" ]; then
+        if [ "$COMMAND" == "adopt" ]; then
+            die "No orphaned service file to adopt for '$APP_NAME'."
+        fi
         return 0
     fi
 
-    # The project folder that installed the existing service
-    local existing
-    existing=$(unit_meta "$SERVICE_FILE" Project)
-
-    if [ -n "$existing" ] && [ "$existing" != "$PROJECT_DIR" ]; then
-        if [ -d "$existing" ]; then
-            echo "❌ Error: Name Conflict!"
-            echo "   The app name '$APP_NAME' is already used by another project:"
-            echo "   👉 $existing"
-            echo ""
-            echo "   To manage this project, you MUST change 'APP_NAME' in:"
-            echo "   $PROJECT_DIR/config.env"
-            echo "   (Example: APP_NAME=\"${APP_NAME}-2\")"
-            return 1
-        fi
-
-        if [[ "$COMMAND" == "up" || "$COMMAND" == "run" || "$COMMAND" == "start" ]]; then
-            echo "⚠️  Notice: Claiming orphaned service name '$APP_NAME' ($existing no longer exists)."
-        fi
+    if ! managed_service_file "$SERVICE_FILE"; then
+        die "'$SERVICE_FILE' is not a managed unit. Choose a different APP_NAME."
     fi
-    return 0
+    existing=$(unit_meta "$SERVICE_FILE" Project)
+    if [ "$existing" == "$PROJECT_DIR" ]; then
+        if [ "$COMMAND" == "adopt" ]; then
+            die "This project already owns '$APP_NAME'. Use 'run'."
+        fi
+        return 0
+    fi
+    if [ -d "$existing" ]; then
+        die "Name Conflict! '$APP_NAME' is already owned by '$existing'. Choose a different APP_NAME."
+    fi
+    if [ "$COMMAND" != "adopt" ]; then
+        die "'$APP_NAME' belongs to the missing project '$existing'. If you moved it here, use 'adopt'."
+    fi
+    echo "Adopting '$APP_NAME' from '$existing'."
 }
 
 warn_config_exports() {
@@ -622,7 +629,7 @@ show_config() {
 managed_service_files() {
     local file
     for file in "$SYSTEMD_DIR/${UNIT_PREFIX}"*.service; do
-        if [ -f "$file" ]; then
+        if managed_service_file "$file"; then
             echo "$file"
         fi
     done
@@ -720,10 +727,19 @@ ps_dashboard() {
 
 # --- DISPATCHER ---
 
+# Serialize mutations before inspecting ownership or changing files.
+case "$COMMAND" in
+    up|down|build|run|start|adopt|stop|restart|stop-all|start-all)
+        mkdir -p "$SYSTEMD_DIR" || die "Cannot create '$SYSTEMD_DIR'."
+        exec {mutation_lock}>"$SYSTEMD_DIR/.systemd-compose.lock" || die "Cannot open the management lock."
+        flock -x "$mutation_lock" || die "Cannot acquire the management lock."
+        ;;
+esac
+
 # Every command that manages the service acts on the service named APP_NAME,
 # so make sure that name is not owned by a different project folder first.
 # exec and config don't touch the service.
-if [ -n "${SERVICE_FILE:-}" ] && [[ "$COMMAND" != "exec" && "$COMMAND" != "config" ]]; then
+if [ -n "${SERVICE_FILE:-}" ] && [[ "$COMMAND" != "exec" && "$COMMAND" != "config" && "$COMMAND" != "build" ]]; then
     if ! check_name_collision; then exit 1; fi
 fi
 
@@ -731,7 +747,7 @@ case "$COMMAND" in
     up)        up ;;
     down)      down ;;
     build)     build ;;
-    run|start) run ;;
+    run|start|adopt) run ;;
     stop)      stop ;;
     restart)   restart ;;
     status)    status ;;

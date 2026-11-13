@@ -61,13 +61,16 @@ load test_helper
     [ -f "$UNIT_DIR/sdc-web.service" ]
 }
 
-@test "a moved project can claim its old name" {
+@test "a moved project must explicitly adopt its orphaned unit" {
     make_app "$TEST_ROOT/app" web false
     bash "$SDC" "$TEST_ROOT/app" run
     mv "$TEST_ROOT/app" "$TEST_ROOT/moved"
     run bash "$SDC" "$TEST_ROOT/moved" run
+    [ "$status" -eq 1 ]
+    assert_output_contains "use 'adopt'"
+    run bash "$SDC" "$TEST_ROOT/moved" adopt
     [ "$status" -eq 0 ]
-    assert_output_contains "Claiming orphaned service name"
+    assert_output_contains "Adopting"
     grep -q "^X-SDC-Project=$TEST_ROOT/moved$" "$UNIT_DIR/sdc-web.service"
 }
 
@@ -104,4 +107,19 @@ load test_helper
     run bash "$SDC" stop-all
     refute_output_contains "pipewire"
     [ "$(current_state pipewire)" == "active" ]
+}
+
+@test "an unmanaged prefixed unit cannot be listed, stopped or removed" {
+    make_app "$TEST_ROOT/app" web false
+    mkdir -p "$UNIT_DIR"
+    printf '[Service]\nExecStart=/bin/true\n' > "$UNIT_DIR/sdc-web.service"
+    unit_state sdc-web active
+    run bash "$SDC" ps
+    refute_output_contains "web"
+    run bash "$SDC" stop-all
+    [ "$(current_state sdc-web)" == active ]
+    run bash "$SDC" "$TEST_ROOT/app" down
+    [ "$status" -eq 1 ]
+    [ -f "$UNIT_DIR/sdc-web.service" ]
+    [ "$(current_state sdc-web)" == active ]
 }
