@@ -17,7 +17,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # Keys a project .env may not set inside systemd-compose itself
 # (they would change how this script runs, not just the app).
-RESERVED_ENV_KEYS=" PATH HOME USER SHELL IFS PWD OLDPWD UID EUID PPID SHLVL SCRIPT_DIR TEMPLATE_FILE SYSTEMD_DIR UNIT_PREFIX PROJECT_DIR INSTALL_DIR SERVICE_FILE UNIT COMMAND "
+RESERVED_ENV_KEYS=" sdc_env_pair sdc_env_key sdc_env_values PATH HOME USER SHELL IFS PWD OLDPWD UID EUID PPID SHLVL SCRIPT_DIR TEMPLATE_FILE SYSTEMD_DIR UNIT_PREFIX PROJECT_DIR INSTALL_DIR SERVICE_FILE UNIT COMMAND "
 
 # --- HELPER FUNCTIONS ---
 
@@ -52,11 +52,11 @@ die() {
     exit 1
 }
 
-# Reads a KEY=VALUE file the same way systemd's EnvironmentFile= does and
-# prints one KEY=VALUE per line: nothing is executed, surrounding quotes are
-# stripped, '#'/';' lines are comments. Problems are reported on stderr.
+# Read the supported single-line subset of systemd's EnvironmentFile syntax.
+# Reject values that systemd would interpret differently from the CLI.
 parse_env_file() {
     local file="$1" line key value lineno=0
+    local single_quoted="^'([^']*)'$" double_quoted='^"([^"\\]*)"$'
     while IFS= read -r line || [ -n "$line" ]; do
         lineno=$((lineno + 1))
         line="${line%$'\r'}"
@@ -75,9 +75,28 @@ parse_env_file() {
         key="${BASH_REMATCH[1]}"
         value="${BASH_REMATCH[2]}"
         value="${value%"${value##*[![:space:]]}"}"
-        if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then
-            value="${BASH_REMATCH[1]}"
-        fi
+        case "$value" in
+            \'*)
+                if [[ "$value" =~ $single_quoted ]]; then
+                    value="${BASH_REMATCH[1]}"
+                else
+                    echo "❌ $file:$lineno: Expected a single-line, single-quoted value." >&2
+                    return 1
+                fi
+                ;;
+            \"*)
+                if [[ "$value" =~ $double_quoted ]]; then
+                    value="${BASH_REMATCH[1]}"
+                else
+                    echo "❌ $file:$lineno: Expected a single-line, double-quoted value without escapes." >&2
+                    return 1
+                fi
+                ;;
+            *\\*)
+                echo "❌ $file:$lineno: Put literal backslashes inside single quotes." >&2
+                return 1
+                ;;
+        esac
         printf '%s=%s\n' "$key" "$value"
     done < "$file"
 }
@@ -85,28 +104,29 @@ parse_env_file() {
 # Turns each key in a .env file into a (non-exported) shell variable, so
 # config.env can use e.g. $PORT.
 load_env_file() {
-    local pair key
-    while IFS= read -r pair; do
-        key="${pair%%=*}"
-        if [[ "$RESERVED_ENV_KEYS" == *" $key "* || "$key" == BASH* ]]; then
-            echo "⚠️  $1: '$key' is reserved; systemd-compose will not read it." >&2
+    local sdc_env_pair sdc_env_key sdc_env_values
+    sdc_env_values=$(parse_env_file "$1") || die "Cannot read project environment."
+    [ -n "$sdc_env_values" ] || return 0
+    while IFS= read -r sdc_env_pair; do
+        sdc_env_key="${sdc_env_pair%%=*}"
+        if [[ "$RESERVED_ENV_KEYS" == *" $sdc_env_key "* || "$sdc_env_key" == BASH* ]]; then
+            echo "⚠️  $1: '$sdc_env_key' is reserved; systemd-compose will not read it." >&2
             continue
         fi
-        printf -v "$key" '%s' "${pair#*=}"
-    done < <(parse_env_file "$1")
+        printf -v "$sdc_env_key" '%s' "${sdc_env_pair#*=}"
+    done <<< "$sdc_env_values"
 }
 
 # Loads a project's .env and config.env into the current shell.
 # Call it in a subshell when looping over several projects.
 load_project_config() {
-    local dir="$1"
-    if [ -f "$dir/.env" ]; then
-        load_env_file "$dir/.env"
+    INSTALL_DIR="$1"
+    if [ -f "$1/.env" ]; then
+        load_env_file "$1/.env"
     fi
-    INSTALL_DIR="$dir"
     set +u
     # shellcheck source=/dev/null
-    source "$dir/config.env"
+    source "$1/config.env"
     set -u
 
     APP_NAME="${APP_NAME:-}"
@@ -784,17 +804,17 @@ exec_command() {
         die "No venv in $INSTALL_DIR. Run 'build' first."
     fi
 
-    local env_vars=() pair
+    local -a env_vars=()
+    local values
     if [ -f "$INSTALL_DIR/.env" ]; then
-        while IFS= read -r pair; do
-            env_vars+=("$pair")
-        done < <(parse_env_file "$INSTALL_DIR/.env" 2>/dev/null)
+        values=$(parse_env_file "$INSTALL_DIR/.env" 2>/dev/null) || die "Cannot read project environment."
+        if [ -n "$values" ]; then mapfile -t env_vars <<< "$values"; fi
     fi
 
     cd "$INSTALL_DIR/$APP_DIR" || die "Can't enter $INSTALL_DIR/$APP_DIR"
     # Same order as the service: .env comes last, so it wins (as in systemd)
     exec env -- \
-        "PATH=$INSTALL_DIR/venv/bin:$PATH" \
+        "PATH=$INSTALL_DIR/venv/bin:/usr/local/bin:/usr/bin:/bin" \
         "VIRTUAL_ENV=$INSTALL_DIR/venv" \
         PYTHONUNBUFFERED=1 \
         PYTHONDONTWRITEBYTECODE=1 \

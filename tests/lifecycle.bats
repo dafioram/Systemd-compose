@@ -224,10 +224,9 @@ load test_helper
 
 @test "restart checks the port in the installed unit" {
     make_app "$TEST_ROOT/app" app true 8000
-    export STUB_LISTEN=8000
-    bash "$SDC" "$TEST_ROOT/app" run
+    STUB_LISTEN=8000 bash "$SDC" "$TEST_ROOT/app" run
     printf 'PORT=9000\n' > "$TEST_ROOT/app/.env"
-    run bash "$SDC" "$TEST_ROOT/app" restart
+    STUB_LISTEN=8000 run bash "$SDC" "$TEST_ROOT/app" restart
     [ "$status" -eq 0 ]
     assert_output_contains "Port 8000"
 }

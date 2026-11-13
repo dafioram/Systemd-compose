@@ -95,3 +95,13 @@ EOF
     assert_output_contains "--fmt \"%h %r\""
     assert_output_contains "--dir \"$TEST_ROOT/my app\""
 }
+
+@test "the shipped example uses one script argument under a path with spaces" {
+    local example="$TEST_ROOT/example app"
+    cp -r "$REPO_DIR/projects/example-app" "$example"
+    mkdir -p "$example/venv/bin"
+    ln -s "$(type -P python3)" "$example/venv/bin/python"
+    run bash "$SDC" "$example" run
+    [ "$status" -eq 0 ]
+    grep -Fx "ExecStart=\"$example/venv/bin/python\" main.py" "$(unit_file example-app)"
+}

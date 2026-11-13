@@ -111,7 +111,7 @@ venv
 
 ### 1. `config.env` (Project Definition)
 
-This file defines *what* to run. It is read only by systemd-compose, as a bash file, when you run a command.
+This file defines *what* to run. Systemd-compose sources it as Bash when you run a project command, so use a trusted project.
 
 ```bash
 APP_NAME="my-awesome-bot"
@@ -123,7 +123,7 @@ APP_DIR="."
 
 # The program to run from venv/bin, and its arguments
 ENTRYPOINT="python"
-ARGS="${INSTALL_DIR}/${APP_DIR}/bot.py"
+ARGS="bot.py"
 
 # "true": PORT must be set in .env and be free before the app starts.
 # "false": background scripts/bots that don't listen on a port.
@@ -157,10 +157,11 @@ SECRET_KEY=super_secret_value
 WEB_WORKERS=1
 ```
 
-Use systemd's format:
+Use this single-line subset of systemd's `EnvironmentFile=` format:
 
 * One plain `KEY=VALUE` per line. Quotes around the value are optional and are stripped.
-* No `export`, no `$VARIABLE` expansion, no `$(commands)`, and no comments after a value. Full-line `#` comments are fine.
+* Values containing literal backslashes must use single quotes. Use a single line per value.
+* Use plain assignments and full-line comments. Variable references and command substitutions are read literally.
 * systemd-compose reads this file too (it never executes it), so `config.env` can use `$PORT`.
 
 `.env` is optional when `REQUIRE_PORT="false"`. `PYTHONUNBUFFERED=1` is always set for you, so `print()` output shows up in the logs immediately.
@@ -212,7 +213,7 @@ To manage a project folder whose name matches a command (e.g. a folder called `l
 
 ```bash
 ENTRYPOINT="python"
-ARGS="${INSTALL_DIR}/${APP_DIR}/main.py"
+ARGS="main.py"
 ```
 
 ### FastAPI / Uvicorn
@@ -220,7 +221,7 @@ ARGS="${INSTALL_DIR}/${APP_DIR}/main.py"
 ```bash
 ENTRYPOINT="uvicorn"
 # Syntax: <file_module>:<app_object>
-ARGS="main:app --app-dir ${INSTALL_DIR}/${APP_DIR} --host 0.0.0.0 --port $PORT"
+ARGS="main:app --host 0.0.0.0 --port $PORT"
 REQUIRE_PORT="true"
 ```
 
@@ -228,14 +229,14 @@ REQUIRE_PORT="true"
 
 ```bash
 ENTRYPOINT="gunicorn"
-ARGS="wsgi:app --chdir ${INSTALL_DIR}/${APP_DIR} --bind 0.0.0.0:$PORT"
+ARGS="wsgi:app --bind 0.0.0.0:$PORT"
 REQUIRE_PORT="true"
 ```
 
 Or keep the settings in a `gunicorn.conf.py` and only pass the port:
 
 ```bash
-ARGS="-c ${INSTALL_DIR}/${APP_DIR}/gunicorn.conf.py --bind 0.0.0.0:$PORT"
+ARGS="-c gunicorn.conf.py --bind 0.0.0.0:$PORT"
 ```
 
 *Remember to add `uvicorn` / `gunicorn` to your `requirements.txt`!*

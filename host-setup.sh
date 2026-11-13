@@ -202,7 +202,12 @@ fix_shell_environment() {
                 if ! grep -q "XDG_RUNTIME_DIR" "$HOME/.bashrc" 2>/dev/null; then
                     read -r -p "Add the user bus settings to ~/.bashrc? [y/N] "
                     if [[ $REPLY =~ ^[Yy]$ ]]; then
-                        if printf '\n# systemd-compose user session settings\nexport XDG_RUNTIME_DIR="%s"\nexport DBUS_SESSION_BUS_ADDRESS="unix:path=\${XDG_RUNTIME_DIR}/bus"\n'                             "$EXPECTED_DIR" >> "$HOME/.bashrc"; then
+                        if {
+                            printf '\n# systemd-compose user session settings\n'
+                            printf 'export XDG_RUNTIME_DIR="%s"\n' "$EXPECTED_DIR"
+                            # shellcheck disable=SC2016
+                            printf '%s\n' 'export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"'
+                        } >> "$HOME/.bashrc"; then
                             echo "✅ Settings added to ~/.bashrc."
                         else
                             echo "❌ Could not update ~/.bashrc." >&2

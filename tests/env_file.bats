@@ -56,3 +56,19 @@ load test_helper
     [ "$status" -eq 0 ]
     grep -q '^EnvironmentFile=-' "$UNIT_DIR/sdc-app.service"
 }
+
+@test "ambiguous escaped values are rejected before config is used" {
+    make_app "$TEST_ROOT/app" app false
+    printf '%s\n' 'LABEL=hello\ world' > "$TEST_ROOT/app/.env"
+    run bash "$SDC" "$TEST_ROOT/app" config
+    [ "$status" -ne 0 ]
+    assert_output_contains "Put literal backslashes inside single quotes"
+}
+
+@test "exec preserves a literal backslash in a single-quoted value" {
+    make_app "$TEST_ROOT/app" app false
+    printf "%s\n" "LABEL='hello\ world'" > "$TEST_ROOT/app/.env"
+    run bash "$SDC" "$TEST_ROOT/app" exec printenv LABEL
+    [ "$status" -eq 0 ]
+    [ "$output" == 'hello\ world' ]
+}
