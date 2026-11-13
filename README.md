@@ -316,10 +316,10 @@ The tests use [bats](https://github.com/bats-core/bats-core) with fake `systemct
 ```bash
 sudo apt install bats shellcheck
 bats tests
-shellcheck systemd-compose.sh host-setup.sh tests/stubs/* tests/test_helper.bash tests/*.bats
+shellcheck systemd-compose.sh host-setup.sh tests/stubs/* tests/test_helper.bash tests/*.bats tests/smoke-systemd.sh
 ```
 
-CI runs both on every pull request.
+CI runs both on every pull request and also runs `bash tests/smoke-systemd.sh` against a real systemd user manager.
 
 ---
 

@@ -18,7 +18,17 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y -q bats
 
       - name: ShellCheck
-        run: shellcheck systemd-compose.sh host-setup.sh tests/stubs/* tests/test_helper.bash tests/*.bats
+        run: shellcheck systemd-compose.sh host-setup.sh tests/stubs/* tests/test_helper.bash tests/*.bats tests/smoke-systemd.sh
 
       - name: Tests
         run: bats tests
+
+      - name: Smoke test with a real user manager
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          for _ in {1..20}; do
+            if systemctl --user show-environment >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          bash tests/smoke-systemd.sh
