@@ -152,3 +152,72 @@ load test_helper
     [ ! -f "$UNIT_DIR/sdc-app.service" ]
     [ "$(current_state sdc-app)" == "inactive" ]
 }
+
+@test "invalid update leaves the previous service running" {
+    make_app "$TEST_ROOT/app" app false
+    bash "$SDC" "$TEST_ROOT/app" run
+    cp "$UNIT_DIR/sdc-app.service" "$TEST_ROOT/previous.service"
+    echo 'MEMORY_MAX=invalid' >> "$TEST_ROOT/app/config.env"
+    run bash "$SDC" "$TEST_ROOT/app" up
+    [ "$status" -ne 0 ]
+    refute_output_contains "Building"
+    [ "$(current_state sdc-app)" == active ]
+    cmp "$UNIT_DIR/sdc-app.service" "$TEST_ROOT/previous.service"
+}
+
+@test "failed manager reload restores the previous unit and running state" {
+    make_app "$TEST_ROOT/app" app false
+    bash "$SDC" "$TEST_ROOT/app" run
+    cp "$UNIT_DIR/sdc-app.service" "$TEST_ROOT/previous.service"
+    echo 'DESCRIPTION=updated' >> "$TEST_ROOT/app/config.env"
+    STUB_RELOAD_FAIL_ONCE=1 run bash "$SDC" "$TEST_ROOT/app" run
+    [ "$status" -ne 0 ]
+    assert_output_contains "Restoring the previous deployment"
+    [ "$(current_state sdc-app)" == active ]
+    [ -e "$STUB_STATE/enabled-sdc-app" ]
+    cmp "$UNIT_DIR/sdc-app.service" "$TEST_ROOT/previous.service"
+}
+
+@test "failed enablement rolls back a new install" {
+    make_app "$TEST_ROOT/app" app false
+    STUB_ENABLE_FAIL=1 run bash "$SDC" "$TEST_ROOT/app" run
+    [ "$status" -ne 0 ]
+    assert_output_contains "Cannot enable boot startup"
+    [ "$(current_state sdc-app)" == inactive ]
+    [ ! -e "$UNIT_DIR/sdc-app.service" ]
+}
+
+@test "unavailable journal does not turn successful startup into failure" {
+    make_app "$TEST_ROOT/app" app false
+    STUB_JOURNAL_FAIL=1 run bash "$SDC" "$TEST_ROOT/app" run
+    [ "$status" -eq 0 ]
+    assert_output_contains "Could not read recent journal entries"
+    [ "$(current_state sdc-app)" == active ]
+}
+
+@test "up switches venvs only after build and restores the previous venv on failure" {
+    make_app "$TEST_ROOT/app" app false
+    bash "$SDC" "$TEST_ROOT/app" run
+    touch "$TEST_ROOT/app/venv/old-marker" "$TEST_ROOT/app/requirements.txt"
+    STUB_RELOAD_FAIL_ONCE=1 run bash "$SDC" "$TEST_ROOT/app" up
+    [ "$status" -ne 0 ]
+    [ "$(current_state sdc-app)" == active ]
+    [ -f "$TEST_ROOT/app/venv/old-marker" ]
+
+    run bash "$SDC" "$TEST_ROOT/app" up
+    [ "$status" -eq 0 ]
+    local previous
+    previous=$(readlink -f "$TEST_ROOT/app/venv")
+    [ -x "$previous/bin/pip" ]
+    "$previous/bin/pip" --version
+    [ ! -e "$TEST_ROOT/app/venv/old-marker" ]
+
+    run bash "$SDC" "$TEST_ROOT/app" up
+    [ "$status" -eq 0 ]
+    [ ! -e "$previous" ]
+    previous=$(readlink -f "$TEST_ROOT/app/venv")
+    run bash "$SDC" "$TEST_ROOT/app" down --volumes
+    [ "$status" -eq 0 ]
+    [ ! -e "$previous" ]
+    [ ! -L "$TEST_ROOT/app/venv" ]
+}

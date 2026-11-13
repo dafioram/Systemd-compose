@@ -253,7 +253,7 @@ warn_config_exports() {
     fi
 }
 
-check_port() {
+validate_port() {
     if [ "$REQUIRE_PORT" == "false" ]; then
         return 0
     fi
@@ -268,6 +268,11 @@ check_port() {
         return 1
     fi
 
+    return 0
+}
+
+check_port() {
+    [ "$REQUIRE_PORT" == "false" ] && return 0
     if port_listening "$PORT"; then
         echo "❌ Error: Port $PORT is already in use."
         echo "   Process blocking this port:"
@@ -285,8 +290,8 @@ check_binary() {
         echo "❌ Error: ENTRYPOINT is not set in config.env (e.g. ENTRYPOINT=\"python\")."
         return 1
     fi
-    BINARY_PATH="$INSTALL_DIR/venv/bin/$ENTRYPOINT"
-    if [ ! -f "$BINARY_PATH" ]; then
+    local binary_path="$1/bin/$ENTRYPOINT"
+    if [ ! -f "$binary_path" ] || [ ! -x "$binary_path" ]; then
         echo "❌ Error: Binary '$ENTRYPOINT' not found in venv. Run 'build' first, and check requirements.txt."
         return 1
     fi
@@ -312,13 +317,14 @@ render_unit() {
     if [[ "$INSTALL_DIR" == *[\"\\]* ]]; then
         die "The project path can't contain '\"' or '\\': $INSTALL_DIR"
     fi
-    if [ -n "$MEMORY_MAX" ] && ! [[ "$MEMORY_MAX" =~ ^[0-9]+[KMGT]?$|^[0-9]+%$|^infinity$ ]]; then
+    if [ -n "$MEMORY_MAX" ] && ! [[ "$MEMORY_MAX" =~ ^[1-9][0-9]*[KMGT%]?$|^infinity$ ]]; then
         die "MEMORY_MAX='$MEMORY_MAX' is invalid. Use a size like 300M or 1G, a percentage like 25%, or leave it empty."
     fi
-    if [ -n "$CPU_QUOTA" ] && ! [[ "$CPU_QUOTA" =~ ^[0-9]+%$ ]]; then
+    if [ -n "$CPU_QUOTA" ] && ! [[ "$CPU_QUOTA" =~ ^[1-9][0-9]*%$ ]]; then
         die "CPU_QUOTA='$CPU_QUOTA' is invalid. Use a percentage of one core, like 50% (or 200% for two cores)."
     fi
 
+    [ -r "$TEMPLATE_FILE" ] || die "Cannot read '$TEMPLATE_FILE'."
     while IFS= read -r line || [ -n "$line" ]; do
         key="${line%%=*}"
         for var in DESCRIPTION INSTALL_DIR ENTRYPOINT APP_DIR ARGS PORT MEMORY_MAX CPU_QUOTA; do
@@ -412,27 +418,29 @@ show_recent_logs() {
 # --- CORE COMMANDS ---
 
 build() {
+    local venv="${1:-$INSTALL_DIR/venv}"
     echo "--- 🏗️ Building ${APP_NAME} ---"
 
     if ! "$PYTHON_BIN" -c "import venv" 2>/dev/null; then
         die "'$PYTHON_BIN' is missing the 'venv' module. Run ./host-setup.sh"
     fi
 
-    if [ ! -d "$INSTALL_DIR/venv" ]; then
+    if [ ! -d "$venv" ]; then
         echo "Creating Python venv..."
-        if ! "$PYTHON_BIN" -m venv "$INSTALL_DIR/venv"; then
-            rm -rf "$INSTALL_DIR/venv"
+        if ! "$PYTHON_BIN" -m venv "$venv"; then
+            rm -rf "$venv"
             die "Failed to create the venv."
         fi
-        if [ ! -f "$INSTALL_DIR/venv/bin/pip" ]; then
+        if [ ! -f "$venv/bin/pip" ]; then
             echo "⚠️  Pip missing. Bootstrapping..."
-            "$INSTALL_DIR/venv/bin/python" -m ensurepip --upgrade || die "Failed to bootstrap pip."
+            "$venv/bin/python" -m ensurepip --upgrade || die "Failed to bootstrap pip."
         fi
     fi
 
     echo "Installing dependencies..."
     if [ -f "$INSTALL_DIR/requirements.txt" ]; then
-        if ! "$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" --quiet --disable-pip-version-check; then
+        if ! (cd "$INSTALL_DIR" &&
+            "$venv/bin/pip" install -r requirements.txt --quiet --disable-pip-version-check); then
             die "Dependency installation failed (see pip output above)."
         fi
     else
@@ -441,47 +449,175 @@ build() {
     echo "Build Complete."
 }
 
-run() {
-    echo "--- 🚀 Starting ${APP_NAME} ---"
+# A fresh venv must stay at the path where Python created it: pip's entry
+# point scripts have absolute shebangs. Only the stable venv symlink moves.
+remove_old_venv() {
+    local saved="$1" target
+    if [ -L "$saved" ]; then
+        target=$(readlink -- "$saved") || return 1
+        if [[ "$target" != /* ]]; then target="$INSTALL_DIR/$target"; fi
+        if [[ "$target" == "$INSTALL_DIR"/.sdc-venv.* && "${target#"$INSTALL_DIR/"}" != */* ]]; then
+            rm -rf -- "$target" || return 1
+        fi
+    fi
+    rm -rf -- "$saved"
+}
 
+rollback_deployment() {
+    local result=$? restored=1
+    if [ "$committed" == 0 ] && [ "$changed" == 1 ]; then
+        echo "Restoring the previous deployment." >&2
+        if [ "$start_attempted" == 1 ]; then
+            systemctl --user stop "${UNIT}.service" || restored=0
+        fi
+        if [ "$enable_attempted" == 1 ] && [ "$was_enabled" != enabled ]; then
+            systemctl --user disable --quiet "${UNIT}.service" || restored=0
+        fi
+        if [ "$unit_replaced" == 1 ]; then
+            if [ -f "$scratch/previous.service" ]; then
+                mv -fT -- "$scratch/previous.service" "$SERVICE_FILE" || restored=0
+            else
+                rm -f -- "$SERVICE_FILE" || restored=0
+            fi
+            systemctl --user daemon-reload || restored=0
+        fi
+        if [ "$venv_linked" == 1 ]; then
+            rm -f -- "$INSTALL_DIR/venv" || restored=0
+        fi
+        if [ -e "$venv_backup/venv" ] || [ -L "$venv_backup/venv" ]; then
+            mv -T -- "$venv_backup/venv" "$INSTALL_DIR/venv" || restored=0
+        fi
+        if [ "$resume_previous" == 1 ]; then
+            systemctl --user reset-failed "${UNIT}.service" 2>/dev/null || :
+            systemctl --user start "${UNIT}.service" || restored=0
+        fi
+    fi
+    if [ "$restored" == 0 ]; then
+        echo "❌ Rollback was incomplete. Inspect systemctl --user and backups at '$scratch' and '${venv_backup:-none}'." >&2
+        return 1
+    fi
+    if [ -n "$scratch" ]; then rm -rf -- "$scratch"; fi
+    if [ -n "$venv_backup" ]; then
+        if ! remove_old_venv "$venv_backup/venv" || ! rmdir -- "$venv_backup"; then
+            echo "⚠️  Could not clean up '$venv_backup'." >&2
+        fi
+    fi
+    if [ "$committed" == 0 ] && [ -n "$staged_venv" ]; then rm -rf -- "$staged_venv"; fi
+    return "$result"
+}
+
+run() (
+    local action="${1:-run}" unit_content verification previous_state
+    local scratch="" staged_venv="" venv_backup=""
+    local committed=0 changed=0 resume_previous=0 unit_replaced=0
+    local start_attempted=0 enable_attempted=0 venv_linked=0 was_enabled=""
+    trap rollback_deployment EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    echo "--- 🚀 Starting ${APP_NAME} ---"
     warn_config_exports
     warn_unenforced_limits
-    if ! check_binary; then exit 1; fi
-
-    # If this app is already installed, stop it first so a port it holds
-    # does not count as "in use" and the new config is applied cleanly.
-    if [ -f "$SERVICE_FILE" ]; then
-        systemctl --user stop "${UNIT}.service" 2>/dev/null
-    fi
-
-    if ! check_port; then exit 1; fi
-
-    mkdir -p "$SYSTEMD_DIR"
-
-    local unit_content
+    validate_port || exit 1
     unit_content=$(render_unit) || exit 1
-    printf '%s\n' "$unit_content" > "$SERVICE_FILE"
 
-    systemctl --user daemon-reload
-    systemctl --user enable --quiet "${UNIT}.service"
-    # Clear a previous "failed" state so the start limit doesn't block us
-    systemctl --user reset-failed "${UNIT}.service" 2>/dev/null
+    # Check a port change before stopping the previous service. For an
+    # unchanged port, the previous instance may still own the listener.
+    if [ ! -f "$SERVICE_FILE" ] || [ "$(unit_meta "$SERVICE_FILE" Port)" != "$PORT" ]; then
+        check_port || exit 1
+    fi
 
+    scratch=$(mktemp -d "$SYSTEMD_DIR/.sdc-deploy.XXXXXX") || die "Cannot stage the service file."
+    printf '%s\n' "$unit_content" > "$scratch/${UNIT}.service" || die "Cannot write the staged service file."
+    if [ -f "$SERVICE_FILE" ]; then
+        cp -p -- "$SERVICE_FILE" "$scratch/previous.service" || die "Cannot save the previous unit."
+        previous_state=$(systemctl --user show --property ActiveState --value "${UNIT}.service") ||
+            die "Cannot read the current service state."
+        case "$previous_state" in
+            active|activating|reloading) resume_previous=1 ;;
+        esac
+        was_enabled=$(systemctl --user is-enabled "${UNIT}.service" 2>/dev/null) || :
+    fi
+
+    if [ "$action" == up ]; then
+        if [ -f "$SERVICE_FILE" ] && [ -f "$INSTALL_DIR/requirements.txt" ]; then
+            staged_venv=$(mktemp -d "$INSTALL_DIR/.sdc-venv.XXXXXX") || die "Cannot stage a venv."
+            rmdir -- "$staged_venv" || die "Cannot prepare the venv directory."
+            build "$staged_venv"
+        else
+            build
+        fi
+    fi
+    check_binary "${staged_venv:-$INSTALL_DIR/venv}" || exit 1
+
+    # Verify the exact unit syntax, using the staged executable when the
+    # stable venv path will only be switched during deployment.
+    if [ -n "$staged_venv" ]; then
+        mkdir "$scratch/verify" || die "Cannot stage unit verification."
+        (
+            INSTALL_DIR_ESCAPED="${INSTALL_DIR//%/%%}"
+            INSTALL_DIR_ESCAPED="${INSTALL_DIR_ESCAPED//\$/\$\$}"
+            staged_path="${staged_venv//%/%%}"
+            staged_path="${staged_path//\$/\$\$}"
+            while IFS= read -r line; do
+                if [[ "$line" == ExecStart=* ]]; then
+                    line="${line/"$INSTALL_DIR_ESCAPED/venv/bin/"/"$staged_path/bin/"}"
+                fi
+                printf '%s\n' "$line"
+            done < "$scratch/${UNIT}.service"
+        ) > "$scratch/verify/${UNIT}.service" || die "Cannot write verification unit."
+    fi
+    local verify_path="$scratch/${UNIT}.service"
+    if [ -n "$staged_venv" ]; then verify_path="$scratch/verify/${UNIT}.service"; fi
+    verification=$(systemd-analyze verify "$verify_path" 2>&1) || {
+        printf '%s\n' "$verification" >&2
+        die "Generated service did not pass systemd verification."
+    }
+    if [[ "$verification" == *"$verify_path:"* ]]; then
+        printf '%s\n' "$verification" >&2
+        die "Generated service has systemd configuration errors."
+    fi
+
+    if [ -f "$SERVICE_FILE" ]; then
+        systemctl --user stop "${UNIT}.service" || die "Cannot stop the previous service."
+        changed=1
+        check_port || exit 1
+    fi
+
+    if [ -n "$staged_venv" ]; then
+        venv_backup=$(mktemp -d "$INSTALL_DIR/.sdc-backup.XXXXXX") || die "Cannot stage the venv switch."
+        if [ -e "$INSTALL_DIR/venv" ] || [ -L "$INSTALL_DIR/venv" ]; then
+            mv -T -- "$INSTALL_DIR/venv" "$venv_backup/venv" || die "Cannot save the previous venv."
+        fi
+        ln -s -- "${staged_venv##*/}" "$INSTALL_DIR/venv" || die "Cannot switch to the staged venv."
+        venv_linked=1
+    fi
+
+    mv -fT -- "$scratch/${UNIT}.service" "$SERVICE_FILE" || die "Cannot install the staged unit."
+    changed=1
+    unit_replaced=1
+    systemctl --user daemon-reload || die "Cannot reload the user manager."
+    systemctl --user reset-failed "${UNIT}.service" 2>/dev/null || :
+
+    start_attempted=1
     if ! systemctl --user start "${UNIT}.service"; then
-        echo ""
-        echo "❌ Fatal: Systemd failed to start the service."
-        show_recent_logs 10
+        echo "❌ Fatal: Systemd failed to start the service." >&2
+        show_recent_logs 10 || :
         exit 1
     fi
-
     if ! wait_for_startup; then
-        show_recent_logs 15
+        show_recent_logs 15 || :
         exit 1
     fi
+    if [ "$was_enabled" != enabled ]; then
+        enable_attempted=1
+        systemctl --user enable --quiet "${UNIT}.service" || die "Cannot enable boot startup."
+    fi
 
+    committed=1
     echo "✅ Service started."
     status
-}
+)
 
 stop() {
     echo "--- 🛑 Stopping ${APP_NAME} ---"
@@ -538,13 +674,14 @@ status() {
         fi
     fi
     echo ""
-    journalctl --user -u "${UNIT}.service" -n 3 --no-pager
+    if ! journalctl --user -u "${UNIT}.service" -n 3 --no-pager; then
+        echo "⚠️  Could not read recent journal entries." >&2
+    fi
 }
 
 up() {
     echo "=== UP: ${APP_NAME} ==="
-    build
-    run
+    run up
 }
 
 down() {
@@ -558,13 +695,15 @@ down() {
 
     echo "=== DOWN: ${APP_NAME} ==="
     stop
-    systemctl --user disable --quiet "${UNIT}.service" 2>/dev/null
-    rm -f "$SERVICE_FILE"
-    systemctl --user daemon-reload
-    systemctl --user reset-failed "${UNIT}.service" 2>/dev/null
-    if [ "$remove_venv" == "1" ] && [ -d "$INSTALL_DIR/venv" ]; then
+    if [ -f "$SERVICE_FILE" ]; then
+        systemctl --user disable --quiet "${UNIT}.service" || die "Could not disable ${UNIT}."
+        rm -f -- "$SERVICE_FILE" || die "Could not remove the unit file."
+        systemctl --user daemon-reload || die "Unit file removed, but the user manager could not reload."
+        systemctl --user reset-failed "${UNIT}.service" 2>/dev/null || :
+    fi
+    if [ "$remove_venv" == 1 ] && { [ -d "$INSTALL_DIR/venv" ] || [ -L "$INSTALL_DIR/venv" ]; }; then
         echo "Removing venv..."
-        rm -rf "$INSTALL_DIR/venv"
+        remove_old_venv "$INSTALL_DIR/venv" || die "Could not remove the venv."
     fi
     echo "Cleanup complete."
 }
@@ -642,7 +781,7 @@ unit_from_file() {
 
 stop_all() {
     echo "--- 🛑 Stopping ALL Managed Services ---"
-    local file unit count=0
+    local file unit count=0 failed=0
     while IFS= read -r file; do
         [ -n "$file" ] || continue
         unit=$(unit_from_file "$file")
@@ -652,15 +791,17 @@ stop_all() {
             echo "✅ Done"
         else
             echo "❌ Failed"
+            failed=1
         fi
         count=$((count + 1))
     done <<< "$(managed_service_files)"
     echo "--- Processed $count apps ---"
+    return "$failed"
 }
 
 start_all() {
     echo "--- 🚀 Starting ALL Managed Services ---"
-    local file unit count=0
+    local file unit count=0 failed=0
     while IFS= read -r file; do
         [ -n "$file" ] || continue
         unit=$(unit_from_file "$file")
@@ -670,10 +811,12 @@ start_all() {
             echo "✅ Triggered"
         else
             echo "❌ Failed"
+            failed=1
         fi
         count=$((count + 1))
     done <<< "$(managed_service_files)"
     echo "--- Processed $count apps ---"
+    return "$failed"
 }
 
 ps_dashboard() {

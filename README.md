@@ -104,7 +104,9 @@ The `.gitignore` in your project should contain at least:
 
 ```
 .env
-venv/
+venv
+.sdc-venv.*
+.sdc-backup.*
 ```
 
 ### 1. `config.env` (Project Definition)
@@ -173,9 +175,9 @@ Run these inside a project folder, or put the folder first: `systemd-compose ~/m
 
 | Command | Description |
 | --- | --- |
-| `systemd-compose up` | **Recommended.** `build` + `run` (like `docker compose up`). |
-| `systemd-compose build` | Creates the `venv` and installs `requirements.txt`. Stops if `pip` fails. |
-| `systemd-compose run` | Writes the service file and (re)starts the app, then waits until it is running. Safe to re-run while the app is running. |
+| `systemd-compose up` | **Recommended.** Build dependencies and deploy. For an installed app with requirements, build a fresh venv before switching the service to it. |
+| `systemd-compose build` | Creates or updates the `venv` in place and installs `requirements.txt`. Use `up` to stage dependencies for an installed app. |
+| `systemd-compose run` | Writes the service file and (re)starts the app, then waits until it is running. Validates the replacement before stopping the app and attempts to restore the previous deployment if the update fails. |
 | `systemd-compose adopt` | Reinstall and start an orphaned service from its moved project folder. Build the venv at the new path first if needed. |
 | `systemd-compose restart` | Restarts the app with the existing service file. Picks up `.env` changes. |
 | `systemd-compose stop` | Stops the app (keeps the venv and logs). It still starts again at boot. |

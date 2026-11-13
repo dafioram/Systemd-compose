@@ -38,8 +38,22 @@ release_ports() {
 }
 
 case "$cmd" in
-    daemon-reload|enable|disable)
+    daemon-reload)
+        if [ "${STUB_RELOAD_FAIL_ONCE:-0}" == 1 ] && [ ! -f "$STATE_DIR/reload-failed" ]; then
+            touch "$STATE_DIR/reload-failed"
+            exit 1
+        fi
         exit 0
+        ;;
+    is-enabled)
+        [ -e "$STATE_DIR/enabled-$unit" ] && echo enabled
+        ;;
+    enable)
+        if [ "${STUB_ENABLE_FAIL:-0}" == 1 ]; then exit 1; fi
+        touch "$STATE_DIR/enabled-$unit"
+        ;;
+    disable)
+        rm -f "$STATE_DIR/enabled-$unit"
         ;;
     reset-failed)
         if [ "$(state)" == "failed" ]; then set_state inactive; fi
